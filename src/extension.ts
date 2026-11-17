@@ -4,9 +4,9 @@ import { levelOf, openMicrophone, renderLevel, type Microphone } from "./audio.t
 import { DeepgramStream } from "./deepgram.ts";
 import { BACKSPACE, SpaceHoldDetector } from "./hold-detector.ts";
 import { loadSettings, saveSettings, settingsPath, type VoiceSettings } from "./settings.ts";
-import { joinSegment } from "./text.ts";
+import { planReplace, separatorBefore } from "./text.ts";
 
-export const COMMAND = "stream-voice";
+export const COMMAND = "voice";
 const WIDGET_KEY = "pi-streaming-voice";
 const KEY_ENV = "DEEPGRAM_API_KEY";
 const KEY_HELP = `Set ${KEY_ENV} in your environment, e.g. fish: set -Ux ${KEY_ENV} <your-key>  (bash/zsh: export ${KEY_ENV}=<your-key>), then restart pi.`;
@@ -42,7 +42,10 @@ type Phase = "connecting" | "listening" | "finishing";
 
 class Take {
   phase: Phase = "connecting";
-  interim = "";
+  /** Unfinalized transcript currently typed in the editor, including its leading separator. */
+  shown = "";
+  /** False once the user moved the cursor or edited mid-take: stop rewriting, insert finals only. */
+  live = true;
   level = 0;
   startedAt = Date.now();
   stopRequested = false;
@@ -101,21 +104,52 @@ export default function streamingVoice(pi: ExtensionAPI): void {
       const label =
         t.phase === "connecting" ? "starting…" : t.phase === "finishing" ? "finishing…" : "listening — release Space to stop";
       const head = `${theme.fg("error", "●")} ${theme.fg("accent", renderLevel(t.level))} ${theme.fg("muted", clock)} ${theme.fg("dim", label)}`;
-      const lines = [truncateToWidth(head, width)];
-      if (t.interim) lines.push(truncateToWidth(theme.fg("dim", `… ${t.interim}`), width));
-      return lines;
+      return [truncateToWidth(head, width)];
     },
     invalidate() {},
   };
 
-  function insertFinal(t: Take, text: string): void {
-    const lines = t.editor.getLines();
-    const cursor = t.editor.getCursor();
-    const before = (lines[cursor.line] ?? "").slice(0, cursor.col);
-    const atLineStart = cursor.col === 0;
-    t.editor.insertTextAtCursor(joinSegment(before.slice(-1), text, atLineStart));
-    t.inserted = true;
+  /** Text on the cursor's line before the cursor. */
+  function textBeforeCursor(editor: EditorLike): string {
+    const cursor = editor.getCursor();
+    return (editor.getLines()[cursor.line] ?? "").slice(0, cursor.col);
+  }
+
+  /** Make the editor show `text` as the live (unfinalized) transcript at the cursor, like Claude Code. */
+  function showLive(t: Take, text: string): void {
+    const trimmed = text.trim();
+    const before = textBeforeCursor(t.editor);
+    if (t.shown && !before.endsWith(t.shown)) {
+      // The user moved the cursor or edited: leave their text alone from now on.
+      t.live = false;
+      t.shown = "";
+    }
+    if (!t.live) return;
+    let target = "";
+    if (trimmed) {
+      const base = before.slice(0, before.length - t.shown.length);
+      target = separatorBefore(base.slice(-1), t.editor.getCursor().col - t.shown.length === 0) + trimmed;
+    }
+    const { backspaces, insert } = planReplace(t.shown, target);
+    for (let i = 0; i < backspaces; i += 1) t.editor.handleInput(BACKSPACE);
+    if (insert) t.editor.insertTextAtCursor(insert);
+    t.shown = target;
     render();
+  }
+
+  function commitFinal(t: Take, text: string): void {
+    if (t.live) {
+      showLive(t, text);
+    }
+    if (!t.live) {
+      // Fallback: append the final segment at wherever the cursor is.
+      const before = textBeforeCursor(t.editor);
+      const trimmed = text.trim();
+      if (trimmed) t.editor.insertTextAtCursor(separatorBefore(before.slice(-1), t.editor.getCursor().col === 0) + trimmed);
+      render();
+    }
+    if (text.trim()) t.inserted = true;
+    t.shown = "";
   }
 
   function notify(message: string, type: "info" | "warning" | "error"): void {
@@ -149,11 +183,8 @@ export default function streamingVoice(pi: ExtensionAPI): void {
     const repaint = setInterval(render, 250);
     try {
       t.stream = new DeepgramStream(key, {
-        onInterim: (text) => {
-          t.interim = text;
-          render();
-        },
-        onFinal: (text) => insertFinal(t, text),
+        onInterim: (text) => showLive(t, text),
+        onFinal: (text) => commitFinal(t, text),
         onError: (message) => void fail(t, message),
       });
       t.mic = await openMicrophone({

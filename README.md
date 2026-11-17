@@ -4,10 +4,10 @@ Push-to-talk voice input for [pi](https://pi.dev): **hold Space** in the editor 
 Speech is streamed to Deepgram Nova-3 and the text lands at your cursor as you speak. It never auto-submits.
 
 - A quick tap of Space still types a space.
-- While you hold Space, a widget above the editor shows a recording dot, a level meter, elapsed time, and the
-  words Deepgram is still guessing at (dim). Finalized phrases are inserted into the editor at the cursor.
+- Words are typed into the editor at the cursor as you speak and corrected in place as Deepgram refines them
+  (like Claude Code's `/voice`). A widget shows a recording dot, a level meter and elapsed time.
 - Only active when the main editor has focus; in dialogs, selectors and overlays Space behaves normally.
-- Works alongside Pi Voice (`ctrl+i`, local model); no shared keys or commands.
+- Registers `/voice`, so it replaces Pi Voice (`pi-transcribe`): uninstall that package first, or both commands get renamed to `/voice:1`/`/voice:2`.
 
 ## Install
 
@@ -31,6 +31,9 @@ To try it once without installing: `pi -e ~/Code/pi-streaming-voice`.
 
 ## Deepgram key
 
+Sign up at [console.deepgram.com](https://console.deepgram.com/signup): new accounts get $200 of free credit,
+which covers a lot of dictation. Create an API key there.
+
 The key is read from `DEEPGRAM_API_KEY` in pi's environment. It is sent only in the `Authorization` header
 to Deepgram and is never stored or logged.
 
@@ -44,12 +47,10 @@ export DEEPGRAM_API_KEY=<your-key>      # bash/zsh, e.g. in ~/.zshrc
 
 Restart pi afterwards. Without a key, holding Space just types spaces.
 
-## `/stream-voice`
+## `/voice`
 
 Toggles voice mode on and off (default: on). The choice is saved in `~/.pi/agent/pi-streaming-voice.json`.
 If the key is missing, it tells you how to set it.
-
-(It is not called `/voice` because Pi Voice already owns that command.)
 
 ## How the hold is detected
 

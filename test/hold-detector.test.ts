@@ -207,11 +207,21 @@ test("kitty path: repeats before the threshold are swallowed", () => {
   assert.deepEqual(h.send(K_REPEAT, 300), { consume: true });
 });
 
-test("kitty path: a press while recording means a missed release", () => {
+test("kitty path: plain-text repeats (Rex, kitty without flag 8) keep recording", () => {
   const h = kittyHarness();
   h.send(PRESS);
   h.advance(400);
-  assert.deepEqual(h.send(PRESS, 100), { consume: true });
+  for (let i = 0; i < 20; i += 1) assert.deepEqual(h.send(PRESS, 30), { consume: true });
+  assert.deepEqual(h.log, ["delete:1", "start"]);
+  assert.deepEqual(h.send(K_RELEASE, 30), { consume: true });
+  assert.deepEqual(h.log, ["delete:1", "start", "stop"]);
+});
+
+test("kitty path: an encoded press while recording means a missed release", () => {
+  const h = kittyHarness();
+  h.send(PRESS);
+  h.advance(400);
+  assert.deepEqual(h.send("\x1b[32u", 100), { consume: true });
   assert.deepEqual(h.log, ["delete:1", "start", "stop"]);
 });
 

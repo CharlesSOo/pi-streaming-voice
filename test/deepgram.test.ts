@@ -9,7 +9,6 @@ import {
   type SocketLike,
   type StreamTiming,
 } from "../src/deepgram.ts";
-import { joinSegment } from "../src/text.ts";
 
 const results = (transcript: string, extra: Record<string, unknown> = {}) =>
   JSON.stringify({ type: "Results", channel: { alternatives: [{ transcript, confidence: 0.9 }] }, ...extra });
@@ -78,13 +77,6 @@ test("floatToLinear16 clamps and encodes little-endian", () => {
   assert.deepEqual([0, 1, 2, 3, 4].map((i) => view.getInt16(i * 2, true)), [0, 32767, -32768, 32767, -16384]);
 });
 
-test("joinSegment spacing", () => {
-  assert.equal(joinSegment("", "Hello.", false), "Hello.");
-  assert.equal(joinSegment("x", "Hello.", false), " Hello.");
-  assert.equal(joinSegment(" ", "Hello.", false), "Hello.");
-  assert.equal(joinSegment("x", "Hello.", true), "Hello.");
-  assert.equal(joinSegment("x", "  ", false), "");
-});
 
 // ---- stream with a fake socket ----
 

@@ -129,8 +129,9 @@ export class SpaceHoldDetector {
           this.finishHold();
           return { consume: true };
         }
-        if (event === "press" && s.path === "kitty") {
-          // A fresh press while "held" means we missed the release.
+        // Text keys repeat as plain text even under kitty (only release is encoded),
+        // so a bare " " is a repeat; only an encoded press means we missed the release.
+        if (event === "press" && s.path === "kitty" && data !== " ") {
           this.finishHold();
           return { consume: true };
         }

@@ -28,25 +28,24 @@ Nova-3 streaming STT instead of Anthropic's private endpoint.
 - Stream 16 kHz mono linear16 PCM to Deepgram `wss://api.deepgram.com/v1/listen` with `model=nova-3`,
   `language=en`, `punctuate=true`, `smart_format=true`, `interim_results=true`. Auth header `Authorization: Token <key>`.
   Send KeepAlive/CloseStream per Deepgram docs; on release, flush and wait for final results before closing.
-- Interim words appear live at the cursor position in the editor, visually distinct (dim) where pi's API allows;
-  if the editor can't style partial text, show interim text in a widget/status line and insert final text only.
+- Interim words are typed live into the editor at the cursor (as in Claude Code) and revised in place; pi's editor cannot dim part of its text, so they render normally.
   Finalized text is inserted at the cursor. Never auto-submit.
 - Recording indicator + audio level meter in the status/widget area while recording.
 
-## /stream-voice command
-- Named `/stream-voice` (not `/voice`): Pi Voice already registers `/voice`, and a duplicate name would make pi rename both to `/voice:1`/`/voice:2`.
+## /voice command
+- Named `/voice`, like Claude Code. Pi Voice (`pi-transcribe`) also registers `/voice`, so it is uninstalled; a duplicate name would make pi rename both to `/voice:1`/`/voice:2`.
 - Toggles voice mode on/off (like Claude Code). Persist in `~/.pi/agent/pi-streaming-voice.json`. Default: on.
 
 ## Key
 - `DEEPGRAM_API_KEY` from the environment. Never store or log it.
-- Missing key: holding Space just types spaces; `/stream-voice` shows how to set it (`set -Ux DEEPGRAM_API_KEY …`).
+- Missing key: holding Space just types spaces; `/voice` shows how to set it (`set -Ux DEEPGRAM_API_KEY …`).
 
 ## Errors
 - Network drop, mic permission denied, Deepgram error → clear `ctx.ui.notify` message; keep whatever text was
   already transcribed. No crash, no stuck recording state.
 
 ## Coexistence
-- Pi Voice (`ctrl+i`, local model) stays installed and unchanged. No keybinding conflict.
+- Replaces Pi Voice (`pi-transcribe`), which must be uninstalled.
 
 ## Out of scope (v1)
 - Keyterm/vocabulary prompting, language selection, auto-submit.
@@ -56,4 +55,4 @@ Nova-3 streaming STT instead of Anthropic's private endpoint.
   releasing leaves the final text in the editor, a tap still types a space, and it works in both `~/el` and `~/Code`.
 - Unit tests cover the hold/tap/release state machine (both detection paths) and the Deepgram message handling
   (interim vs final, error frames) without network or mic.
-- README documents install, key setup, and `/stream-voice`.
+- README documents install, key setup, and `/voice`.
