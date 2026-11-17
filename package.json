@@ -1,9 +1,13 @@
 {
   "name": "pi-streaming-voice",
-  "version": "0.1.0",
-  "description": "Push-to-talk (hold Space) streaming voice input for pi, using Deepgram Nova-3",
+  "version": "0.2.0",
+  "description": "Push-to-talk streaming voice input for pi, using Deepgram Nova-3",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CharlesSOo/pi-streaming-voice.git"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -17,7 +21,7 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "npm run check && node --test test/*.test.ts"
+    "test": "npm run check && node --experimental-test-module-mocks --test test/*.test.ts"
   },
   "pi": {
     "extensions": [

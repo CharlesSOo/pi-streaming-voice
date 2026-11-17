@@ -1,12 +1,21 @@
 /** Deepgram live (streaming) transcription over WebSocket. */
 
 export const SAMPLE_RATE = 16_000;
-export const DEEPGRAM_LISTEN_URL = "wss://api.deepgram.com/v1/listen";
+
+/** Deepgram hosts. Same key and paths on each; a regional host keeps processing in that region. */
+export const REGION_HOSTS = {
+  global: "api.deepgram.com",
+  eu: "api.eu.deepgram.com",
+  au: "api.au.deepgram.com",
+  in: "api.in.deepgram.com",
+} as const;
+
+export type Region = keyof typeof REGION_HOSTS;
 const KEEPALIVE_MS = 5_000;
 const FINALIZE_TIMEOUT_MS = 3_000;
 const CLOSE_TIMEOUT_MS = 2_000;
 
-export function buildListenUrl(base = DEEPGRAM_LISTEN_URL): string {
+export function buildListenUrl(region: Region = "global"): string {
   const params = new URLSearchParams({
     model: "nova-3",
     language: "en",
@@ -17,12 +26,12 @@ export function buildListenUrl(base = DEEPGRAM_LISTEN_URL): string {
     sample_rate: String(SAMPLE_RATE),
     channels: "1",
   });
-  return `${base}?${params.toString()}`;
+  return `wss://${REGION_HOSTS[region]}/v1/listen?${params.toString()}`;
 }
 
 export type DeepgramEvent =
-  | { kind: "interim"; text: string }
-  | { kind: "final"; text: string; fromFinalize: boolean }
+  | { kind: "interim"; text: string; end: number }
+  | { kind: "final"; text: string; end: number; fromFinalize: boolean }
   | { kind: "error"; message: string }
   | { kind: "ignore" };
 
@@ -47,13 +56,17 @@ export function parseDeepgramMessage(raw: string): DeepgramEvent {
   const channel = m.channel as { alternatives?: Array<{ transcript?: unknown }> } | undefined;
   const transcript = channel?.alternatives?.[0]?.transcript;
   const text = typeof transcript === "string" ? transcript.trim() : "";
-  if (m.is_final === true) return { kind: "final", text, fromFinalize: m.from_finalize === true };
-  return { kind: "interim", text };
+  // Where in the audio this result ends, in seconds.
+  const end = (typeof m.start === "number" ? m.start : 0) + (typeof m.duration === "number" ? m.duration : 0);
+  if (m.is_final === true) return { kind: "final", text, end, fromFinalize: m.from_finalize === true };
+  return { kind: "interim", text, end };
 }
 
 /** Explain a WebSocket close the user should hear about, or undefined for a normal close. */
-export function describeClose(code: number, reason: string): string | undefined {
+export function describeClose(code: number, reason: string, opened = true): string | undefined {
   if (code === 1000) return undefined;
+  // A rejected key fails the handshake, which looks the same as no network.
+  if (!opened) return `Could not connect to Deepgram${reason ? ` (${reason})` : ""}: check DEEPGRAM_API_KEY and your network`;
   if (code === 1008 || code === 1011 || code === 4000 || reason) {
     return `Deepgram closed the connection (${code}${reason ? `: ${reason}` : ""})`;
   }
@@ -117,18 +130,23 @@ const realTiming: StreamTiming = {
 
 /**
  * One live transcription session. Audio sent before the socket opens is
- * buffered. `finish()` flushes (Finalize), waits for the final results, then
- * sends CloseStream and waits for the server to close.
+ * buffered. `finish()` flushes (Finalize) and resolves once the final results
+ * are in; the socket is then closed (CloseStream) in the background.
  */
 export class DeepgramStream {
   private readonly socket: SocketLike;
   private pending: Uint8Array[] = [];
   private keepAlive: unknown;
+  private closeTimer: unknown;
+  private opened = false;
   private failed = false;
   private closed = false;
   private finishing = false;
-  private finalizeWaiter: (() => void) | undefined;
-  private closeWaiter: (() => void) | undefined;
+  /** `finish()` has resolved: whatever arrives now is too late to use. */
+  private settled = false;
+  /** Audio position the last interim reached; a final ending earlier leaves part of it standing. */
+  private interimEnd = 0;
+  private finalizeWaiter: ((finalized: boolean) => void) | undefined;
   private openWaiter: (() => void) | undefined;
 
   private readonly cb: StreamCallbacks;
@@ -146,6 +164,7 @@ export class DeepgramStream {
     this.socket = factory(url, apiKey);
     this.socket.binaryType = "arraybuffer";
     this.socket.onopen = () => {
+      this.opened = true;
       for (const chunk of this.pending) this.socket.send(chunk);
       this.pending = [];
       this.keepAlive = this.timing.setInterval(() => this.sendJson({ type: "KeepAlive" }), KEEPALIVE_MS);
@@ -165,15 +184,19 @@ export class DeepgramStream {
 
   /** Test hook / internal: process one server text frame. */
   handleMessage(raw: string): void {
+    if (this.settled) return;
     const event = parseDeepgramMessage(raw);
     switch (event.kind) {
       case "interim":
+        this.interimEnd = event.end;
         this.cb.onInterim(event.text);
         break;
       case "final":
         if (event.text) this.cb.onFinal(event.text);
-        this.cb.onInterim("");
-        if (event.fromFinalize) this.resolveFinalize();
+        // An empty final retracts the interim only if it covers all of it;
+        // one for the silence before the words leaves them for the next interim.
+        else if (event.fromFinalize || event.end >= this.interimEnd) this.cb.onInterim("");
+        if (event.fromFinalize) this.resolveFinalize(true);
         break;
       case "error":
         this.fail(event.message);
@@ -191,39 +214,54 @@ export class DeepgramStream {
     else this.pending.push(pcm);
   }
 
-  /** Flush and wait for final results, then close. Never throws. */
-  async finish(): Promise<void> {
-    if (this.finishing) return;
+  /**
+   * Flush and wait for the final results. Resolves false if Deepgram did not
+   * confirm them in time, so the last words may be missing. Never throws.
+   */
+  async finish(): Promise<boolean> {
+    if (this.finishing) return true;
     this.finishing = true;
-    if (this.failed || this.closed) return this.cleanup();
+    if (this.failed || this.closed) {
+      this.settled = true;
+      this.cleanup();
+      return true;
+    }
     if (this.socket.readyState !== OPEN) {
       // Never connected: wait briefly for the open so buffered audio still gets transcribed.
-      await this.waitFor((resolve) => {
+      await this.waitFor<void>((resolve) => {
         this.openWaiter = resolve;
-      }, FINALIZE_TIMEOUT_MS);
+      }, FINALIZE_TIMEOUT_MS, undefined);
       this.openWaiter = undefined;
       if (this.socket.readyState !== OPEN) {
+        const timedOut = !this.failed && !this.closed;
+        this.settled = true;
         this.socket.close(1000);
-        return this.cleanup();
+        this.cleanup();
+        return !timedOut;
       }
     }
     this.sendJson({ type: "Finalize" });
-    await this.waitFor((resolve) => {
+    const finalized = await this.waitFor<boolean>((resolve) => {
       this.finalizeWaiter = resolve;
-    }, FINALIZE_TIMEOUT_MS);
-    this.sendJson({ type: "CloseStream" });
+    }, FINALIZE_TIMEOUT_MS, false);
+    this.finalizeWaiter = undefined;
+    this.settled = true;
+    // The words are in; the goodbye does not need to hold anyone up.
     if (!this.closed) {
-      await this.waitFor((resolve) => {
-        this.closeWaiter = resolve;
+      this.sendJson({ type: "CloseStream" });
+      this.closeTimer = this.timing.setTimer(() => {
+        this.closeTimer = undefined;
+        if (!this.closed) this.socket.close(1000);
+        this.cleanup();
       }, CLOSE_TIMEOUT_MS);
     }
-    if (!this.closed) this.socket.close(1000);
-    this.cleanup();
+    return finalized || this.failed || this.closed;
   }
 
   /** Drop everything immediately. */
   abort(): void {
     this.finishing = true;
+    this.settled = true;
     try {
       this.socket.close(1000);
     } catch {
@@ -234,14 +272,13 @@ export class DeepgramStream {
 
   private handleClose(code: number, reason: string): void {
     this.closed = true;
-    const problem = describeClose(code, reason);
+    const problem = describeClose(code, reason, this.opened);
     // Closing after CloseStream is expected; anything abnormal before that is an error.
-    if (problem && !this.failed) this.fail(problem);
-    this.resolveFinalize();
-    const waiters = [this.closeWaiter, this.openWaiter];
-    this.closeWaiter = undefined;
+    if (problem && !this.failed && !this.settled) this.fail(problem);
+    this.resolveFinalize(false);
+    const w = this.openWaiter;
     this.openWaiter = undefined;
-    for (const w of waiters) w?.();
+    w?.();
     this.cleanup();
   }
 
@@ -249,37 +286,40 @@ export class DeepgramStream {
     if (this.failed) return;
     this.failed = true;
     this.cb.onError(message);
-    this.resolveFinalize();
+    this.resolveFinalize(false);
   }
 
-  private resolveFinalize(): void {
+  private resolveFinalize(finalized: boolean): void {
     const w = this.finalizeWaiter;
     this.finalizeWaiter = undefined;
-    w?.();
+    w?.(finalized);
   }
 
   private sendJson(msg: object): void {
     if (this.socket.readyState === OPEN) this.socket.send(JSON.stringify(msg));
   }
 
-  private waitFor(arm: (resolve: () => void) => void, ms: number): Promise<void> {
-    return new Promise<void>((resolve) => {
+  /** Resolves with what `arm`'s callback is given, or with `fallback` after `ms` or once the stream is dead. */
+  private waitFor<T>(arm: (resolve: (value: T) => void) => void, ms: number, fallback: T): Promise<T> {
+    return new Promise<T>((resolve) => {
       let done = false;
-      const finish = () => {
+      const finish = (value: T) => {
         if (done) return;
         done = true;
         this.timing.clearTimer(timer);
-        resolve();
+        resolve(value);
       };
-      const timer = this.timing.setTimer(finish, ms);
+      const timer = this.timing.setTimer(() => finish(fallback), ms);
       arm(finish);
-      if (this.failed || this.closed) finish();
+      if (this.failed || this.closed) finish(fallback);
     });
   }
 
   private cleanup(): void {
     if (this.keepAlive !== undefined) this.timing.clearInterval(this.keepAlive);
     this.keepAlive = undefined;
+    if (this.closeTimer !== undefined) this.timing.clearTimer(this.closeTimer);
+    this.closeTimer = undefined;
     this.pending = [];
   }
 }

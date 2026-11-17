@@ -30,16 +30,35 @@ test("listen URL has the required parameters", () => {
   }
 });
 
+test("listen URL uses the host of the chosen region", () => {
+  for (const [region, host] of [
+    ["global", "api.deepgram.com"],
+    ["eu", "api.eu.deepgram.com"],
+    ["au", "api.au.deepgram.com"],
+    ["in", "api.in.deepgram.com"],
+  ] as const) {
+    const url = new URL(buildListenUrl(region));
+    assert.equal(url.protocol + "//" + url.host + url.pathname, `wss://${host}/v1/listen`, region);
+    assert.equal(url.search, new URL(buildListenUrl()).search, "same parameters on every host");
+  }
+});
+
 test("parse: interim vs final", () => {
-  assert.deepEqual(parseDeepgramMessage(results("hello wor", { is_final: false })), { kind: "interim", text: "hello wor" });
-  assert.deepEqual(parseDeepgramMessage(results("Hello world.", { is_final: true, speech_final: true })), {
+  assert.deepEqual(parseDeepgramMessage(results("hello wor", { is_final: false, start: 1, duration: 0.5 })), {
+    kind: "interim",
+    text: "hello wor",
+    end: 1.5,
+  });
+  assert.deepEqual(parseDeepgramMessage(results("Hello world.", { is_final: true, speech_final: true, start: 1, duration: 2 })), {
     kind: "final",
     text: "Hello world.",
+    end: 3,
     fromFinalize: false,
   });
   assert.deepEqual(parseDeepgramMessage(results("", { is_final: true, from_finalize: true })), {
     kind: "final",
     text: "",
+    end: 0,
     fromFinalize: true,
   });
 });
@@ -69,6 +88,9 @@ test("describeClose", () => {
   assert.equal(describeClose(1000, ""), undefined);
   assert.match(describeClose(1006, "") ?? "", /Lost connection/);
   assert.match(describeClose(1008, "DATA-0000") ?? "", /DATA-0000/);
+  // Never opened: a rejected key and a dead network look the same, so point at both.
+  assert.match(describeClose(1006, "", false) ?? "", /Could not connect to Deepgram: check DEEPGRAM_API_KEY/);
+  assert.equal(describeClose(1000, "", false), undefined);
 });
 
 test("floatToLinear16 clamps and encodes little-endian", () => {
@@ -160,7 +182,19 @@ test("stream: interim then final events", () => {
   socket.message(results("hel", { is_final: false }));
   socket.message(results("hello there", { is_final: false }));
   socket.message(results("Hello there.", { is_final: true }));
-  assert.deepEqual(events, ["interim:hel", "interim:hello there", "final:Hello there.", "interim:"]);
+  assert.deepEqual(events, ["interim:hel", "interim:hello there", "final:Hello there."]);
+});
+
+test("stream: an empty final for the silence before the words does not blank the interim", () => {
+  const { socket, events } = makeStream();
+  socket.open();
+  socket.message(results("The quick brown", { is_final: false, start: 0, duration: 2.5 }));
+  socket.message(results("", { is_final: true, start: 0, duration: 1.2 })); // covers only the silent lead-in
+  socket.message(results("The quick brown fox jumps over", { is_final: false, start: 1.2, duration: 2.6 }));
+  assert.deepEqual(events, ["interim:The quick brown", "interim:The quick brown fox jumps over"]);
+  // An empty final that covers the whole interim does retract it.
+  socket.message(results("", { is_final: true, start: 1.2, duration: 2.6 }));
+  assert.equal(events.at(-1), "interim:");
 });
 
 test("stream: finish sends Finalize, waits for from_finalize, then CloseStream", async () => {
@@ -172,17 +206,33 @@ test("stream: finish sends Finalize, waits for from_finalize, then CloseStream",
     }
     if (msg.type === "CloseStream") setTimeout(() => socket.serverClose(1000, ""), 1);
   };
-  await stream.finish();
+  assert.equal(await stream.finish(), true);
   assert.deepEqual(socket.json(), ["Finalize", "CloseStream"]);
   assert.ok(events.includes("final:last words"));
   assert.ok(!events.some((e) => e.startsWith("error")));
 });
 
+test("stream: finish resolves on the finalized result without waiting for the server to close", async () => {
+  const { socket, events, stream } = makeStream();
+  socket.open();
+  socket.onSendJson = (msg) => {
+    if (msg.type === "Finalize") setTimeout(() => socket.message(results("done", { is_final: true, from_finalize: true })), 1);
+  };
+  assert.equal(await stream.finish(), true);
+  assert.equal(socket.readyState, 1, "still open: the close happens in the background");
+  assert.deepEqual(socket.json(), ["Finalize", "CloseStream"]);
+  socket.message(results("too late", { is_final: true })); // nothing may reach the editor any more
+  assert.deepEqual(events, ["final:done"]);
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(socket.closedWith, 1000, "closed by us when the server does not");
+});
+
 test("stream: finish times out if Deepgram never answers", async () => {
   const { socket, stream } = makeStream();
   socket.open();
-  await stream.finish();
+  assert.equal(await stream.finish(), false, "tells the caller the last words may be missing");
   assert.deepEqual(socket.json(), ["Finalize", "CloseStream"]);
+  await new Promise((r) => setTimeout(r, 40));
   assert.equal(socket.closedWith, 1000);
 });
 
@@ -203,12 +253,11 @@ test("stream: network drop reports an error", () => {
   assert.deepEqual(events, ["error:Lost connection to Deepgram"]);
 });
 
-test("stream: auth failure before open; finish still resolves", async () => {
+test("stream: auth failure before open names the key; finish still resolves", async () => {
   const { socket, events, stream } = makeStream();
-  socket.serverClose(1008, "Invalid credentials");
-  await stream.finish();
-  assert.equal(events.length, 1);
-  assert.match(events[0] ?? "", /Invalid credentials/);
+  socket.serverClose(1006, "");
+  assert.equal(await stream.finish(), true);
+  assert.deepEqual(events, ["error:Could not connect to Deepgram: check DEEPGRAM_API_KEY and your network"]);
 });
 
 test("stream: finish before open waits for the connection, then flushes", async () => {
