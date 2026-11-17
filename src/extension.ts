@@ -1,5 +1,5 @@
 import { getAgentDir, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
-import { isKittyProtocolActive, truncateToWidth, type Component, type TUI } from "@earendil-works/pi-tui";
+import { isKittyProtocolActive, truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { levelOf, openMicrophone, renderLevel, type Microphone } from "./audio.ts";
 import { DeepgramStream } from "./deepgram.ts";
 import { BACKSPACE, SpaceHoldDetector } from "./hold-detector.ts";
@@ -47,7 +47,6 @@ class Take {
   /** False once the user moved the cursor or edited mid-take: stop rewriting, insert finals only. */
   live = true;
   level = 0;
-  startedAt = Date.now();
   stopRequested = false;
   mic: Microphone | undefined;
   stream: DeepgramStream | undefined;
@@ -99,12 +98,13 @@ export default function streamingVoice(pi: ExtensionAPI): void {
     render(width: number): string[] {
       const t = take;
       if (!t || !theme) return [];
-      const elapsed = Math.floor((Date.now() - t.startedAt) / 1000);
-      const clock = `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")}`;
-      const label =
-        t.phase === "connecting" ? "starting…" : t.phase === "finishing" ? "finishing…" : "listening — release Space to stop";
-      const head = `${theme.fg("error", "●")} ${theme.fg("accent", renderLevel(t.level))} ${theme.fg("muted", clock)} ${theme.fg("dim", label)}`;
-      return [truncateToWidth(head, width)];
+      // Right-aligned above the editor, where Claude Code shows "listening…".
+      const label = t.phase === "connecting" ? "starting…" : t.phase === "finishing" ? "transcribing…" : "listening…";
+      const head = truncateToWidth(
+        `${theme.fg("error", "●")} ${theme.fg("accent", renderLevel(t.level, 4))} ${theme.fg("dim", label)}`,
+        Math.max(0, width - 1),
+      );
+      return [" ".repeat(Math.max(0, width - 1 - visibleWidth(head))) + head];
     },
     invalidate() {},
   };

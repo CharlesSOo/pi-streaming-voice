@@ -5,7 +5,7 @@ Speech is streamed to Deepgram Nova-3 and the text lands at your cursor as you s
 
 - A quick tap of Space still types a space.
 - Words are typed into the editor at the cursor as you speak and corrected in place as Deepgram refines them
-  (like Claude Code's `/voice`). A widget shows a recording dot, a level meter and elapsed time.
+  (like Claude Code's `/voice`). A small recording dot, level meter and `listening…` show at the right, above the editor.
 - Only active when the main editor has focus; in dialogs, selectors and overlays Space behaves normally.
 - Registers `/voice`, so it replaces Pi Voice (`pi-transcribe`): uninstall that package first, or both commands get renamed to `/voice:1`/`/voice:2`.
 
