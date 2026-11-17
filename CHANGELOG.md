@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.1] - 2026-11-18
+
+### Added
+- Region `Auto`, the new default: at session start the connection to each of the four Deepgram hosts is timed in the
+  background and the fastest is used. The pick is saved, so the next session starts with it, and
+  `/voice-settings` shows it, e.g. `Auto (India, 140 ms)`. The measurement opens a TLS connection only: it sends
+  no API key and no audio.
+
+### Changed
+- A settings file without `region` now loads as `auto` (was `global`). Auto may send audio to any of the four
+  regions; choose a region in `/voice-settings` to keep processing in it.
+- The settings file gains `autoPick`, the region Auto last measured as fastest.
+
 ## [0.2.0] - 2026-11-18
 
 ### Added

@@ -56,14 +56,15 @@ the toggle goes.
 ## `/voice-settings`
 
 Opens a menu with four rows. Changes apply immediately and are saved, with the `/voice` toggle, in
-`~/.pi/agent/pi-streaming-voice.json` as `{enabled, hotkey, mode, region}`.
+`~/.pi/agent/pi-streaming-voice.json` as `{enabled, hotkey, mode, region}` (plus `autoPick`, the region Auto last
+measured as fastest).
 
 | Row | Values | Default |
 |---|---|---|
 | Voice | on, off | on |
 | Hotkey | Space, or a combo with ctrl, alt or cmd | `space` |
 | Mode | hold, tap | hold |
-| Region | Global, EU, Australia, India | Global |
+| Region | Auto, Global, EU, Australia, India | Auto |
 
 ### Hotkey
 
@@ -101,7 +102,8 @@ chosen host.
 
 | Region | Host |
 |---|---|
-| Global (default) | `api.deepgram.com` |
+| Auto (default) | the fastest of the four below |
+| Global | `api.deepgram.com` |
 | EU | `api.eu.deepgram.com` |
 | Australia | `api.au.deepgram.com` |
 | India | `api.in.deepgram.com` |
@@ -109,6 +111,16 @@ chosen host.
 A regional host keeps processing in that region and does not fall back to another one if it is unavailable. A
 nearer region shortens the wait for the first words: measured from Southeast Asia, the connection opened in
 1.8–2.1 s on Global and 1.0–1.1 s on India, with the same transcript.
+
+**Auto** finds the nearest one for you. When a pi session starts, it times a connection to each of the four hosts
+in the background (three tries each, taking the median) and uses the fastest; a host that fails or does not answer
+within 3 s is skipped. The pick is saved, so the next session starts with it right away, and the menu shows it
+next to Auto, e.g. `Auto (India, 140 ms)`. Until the first measurement has finished, Global is used. If no host
+answers (for example offline), the last saved pick is kept. A take that is already running stays on its host. The measurement only opens a TLS connection and
+drops it: it sends no API key and no audio, and costs nothing.
+
+**Auto may send your audio to any of the four regions.** If processing has to stay in one region, choose that
+region explicitly; a fixed region is never measured and never changes.
 
 ## How the hold is detected
 

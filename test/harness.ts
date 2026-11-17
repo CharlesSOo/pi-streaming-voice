@@ -1,11 +1,12 @@
 // Runs the real extension against a real pi-tui Editor, a fake WebSocket and a mocked microphone.
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mock } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Editor, isKeyRelease, KeybindingsManager, setKittyProtocolActive, TUI_KEYBINDINGS, type TUI } from "@earendil-works/pi-tui";
 import streamingVoice from "../src/extension.ts";
+import type { Timings } from "../src/region-probe.ts";
 
 export const TEST_KEY = "dg_test_key_0123456789";
 process.env.DEEPGRAM_API_KEY = TEST_KEY;
@@ -146,8 +147,10 @@ export interface Rig {
   savedSettings(): unknown;
 }
 
-export function makeRig(opts: { kitty?: boolean } = {}): Rig {
+/** `timings`: what the Auto region measurement returns; left out, it never finishes. `settings`: the settings file to start with. */
+export function makeRig(opts: { kitty?: boolean; timings?: Timings; settings?: object } = {}): Rig {
   const agentDir = mkdtempSync(join(tmpdir(), "psv-agent-"));
+  if (opts.settings) writeFileSync(join(agentDir, "pi-streaming-voice.json"), JSON.stringify(opts.settings));
   process.env.PI_CODING_AGENT_DIR = agentDir;
   FakeSocket.instances = [];
   FakeSocket.autoClose = true;
@@ -206,7 +209,8 @@ export function makeRig(opts: { kitty?: boolean } = {}): Rig {
       commands.set(name, def.handler);
     },
   };
-  streamingVoice(pi as unknown as ExtensionAPI);
+  const timings = opts.timings;
+  streamingVoice(pi as unknown as ExtensionAPI, () => (timings ? Promise.resolve(timings) : new Promise<Timings>(() => {})));
   handlers.get("session_start")?.({}, ctx);
 
   rig.feed = (data) => {

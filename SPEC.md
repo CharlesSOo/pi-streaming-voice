@@ -39,7 +39,7 @@ Nova-3 streaming STT instead of Anthropic's private endpoint.
 ## /voice-settings (0.2.0)
 - Menu with four rows: Voice (on/off), Hotkey, Mode (hold/tap), Region.
 - Persist in `~/.pi/agent/pi-streaming-voice.json` as `{enabled, hotkey, mode, region}`. Defaults: `hotkey: "space"`,
-  `mode: "hold"`, `region: "global"`. A file that only has `enabled` loads with those defaults.
+  `mode: "hold"`, `region: "auto"` (0.2.1; was `"global"`). A file that only has `enabled` loads with those defaults.
 
 ### Hotkey
 - Choosing Hotkey shows "press the key you want"; Escape cancels and keeps the old key. Keys are parsed by pi-tui
@@ -64,6 +64,20 @@ Nova-3 streaming STT instead of Anthropic's private endpoint.
 ### Region
 - Global (`api.deepgram.com`, default), EU (`api.eu.deepgram.com`), Australia (`api.au.deepgram.com`), India
   (`api.in.deepgram.com`). Same key and paths; only the host changes. The next take uses the chosen host.
+
+### Region: Auto (0.2.1)
+- Region gains `auto`, the default: Auto, Global, EU, Australia, India. A settings file without `region` loads as
+  `auto`.
+- With `auto`, at session start (and when Auto is chosen or voice is turned on) the extension times a connection to
+  each of the four hosts in the background: three tries per host, median, 3 s timeout per try. It never blocks
+  startup or a take. The fastest host is used. A host with a failed or timed-out try is skipped; if none is left,
+  the last cached pick is kept, or Global when there is none.
+- The pick is cached in the settings file as `autoPick: {region, ms}` (no `ms` when no host answered), so the next
+  session starts with it; until the first measurement finishes, Global is used. A take in progress never changes
+  host.
+- `/voice-settings` shows the pick next to Auto, e.g. `Auto (India, 140 ms)`.
+- Choosing a fixed region turns measuring off; so does turning voice off.
+- The probe times a TCP+TLS connect to port 443 and drops the connection: no HTTP request, no API key, no stream.
 
 ## Take behaviour (0.2.0)
 - A hold that has seen auto-repeats ends when the repeats stop for the release gap, on every path: a take never keeps
@@ -97,6 +111,6 @@ Nova-3 streaming STT instead of Anthropic's private endpoint.
 - In the user's terminal (Rex; also works in a Kitty-protocol terminal): holding Space streams live text,
   releasing leaves the final text in the editor, a tap still types a space, and it works in both `~/el` and `~/Code`.
 - Unit tests cover the hold/tap/release state machine (both detection paths, combo hold, tap mode), key validation,
-  settings loading (a file that only has `enabled`, region default), the listen URL per region, and the Deepgram
+  settings loading (a file that only has `enabled`, region default), the Auto region pick, the listen URL per region, and the Deepgram
   message handling (interim vs final, error frames) without network or mic.
 - README documents install, key setup, `/voice` and `/voice-settings`.

@@ -21,6 +21,13 @@ export interface SettingsHost {
 
 const REGION_LABELS: Record<Region, string> = { global: "Global", eu: "EU", au: "Australia", in: "India" };
 
+/** The Auto value with its current pick, e.g. `Auto (India, 140 ms)`. */
+function autoLabel(settings: VoiceSettings): string {
+  const pick = settings.autoPick;
+  if (!pick) return "Auto";
+  return `Auto (${REGION_LABELS[pick.region]}${pick.ms === undefined ? "" : `, ${pick.ms} ms`})`;
+}
+
 /** "Press the key you want": resolves with a valid hotkey, or undefined when cancelled with Escape. */
 function captureHotkey(
   theme: Theme,
@@ -63,6 +70,15 @@ export function createSettingsMenu(
   /** Hotkey capture opened by choosing tap while the hotkey is Space. */
   let capture: Component | undefined;
 
+  let auto = autoLabel(settings);
+  const regionItem: SettingItem = {
+    id: "region",
+    label: "Region",
+    description: "Deepgram host for the next take. Auto measures all four and uses the fastest; regional hosts process in-region only",
+    currentValue: settings.region === "auto" ? auto : REGION_LABELS[settings.region],
+    values: [auto, ...Object.values(REGION_LABELS)],
+  };
+
   const items: SettingItem[] = [
     { id: "enabled", label: "Voice", currentValue: settings.enabled ? "on" : "off", values: ["on", "off"] },
     {
@@ -79,13 +95,7 @@ export function createSettingsMenu(
       currentValue: settings.mode,
       values: ["hold", "tap"],
     },
-    {
-      id: "region",
-      label: "Region",
-      description: "Deepgram host for the next take. A nearer one answers sooner; regional hosts process in-region only",
-      currentValue: REGION_LABELS[settings.region],
-      values: Object.values(REGION_LABELS),
-    },
+    regionItem,
   ];
 
   const list = new SettingsList(
@@ -110,7 +120,7 @@ export function createSettingsMenu(
         }
       } else if (id === "region") {
         const region = (Object.keys(REGION_LABELS) as Region[]).find((r) => REGION_LABELS[r] === value);
-        if (region) host.update({ region });
+        host.update({ region: region ?? "auto" });
       } else if (id === "mode") {
         if (value === "tap" && host.current().hotkey === DEFAULT_HOTKEY) {
           // Tap needs a combo: ask for one, and stay on hold if that is cancelled.
@@ -134,6 +144,13 @@ export function createSettingsMenu(
     capturesViewportInput: list.capturesViewportInput,
     render(width: number): string[] {
       if (capture) return capture.render(width);
+      // A measurement that finished while the menu is open shows up in the Auto value.
+      const label = autoLabel(host.current());
+      if (label !== auto) {
+        auto = label;
+        regionItem.values = [auto, ...Object.values(REGION_LABELS)];
+        if (host.current().region === "auto") list.updateValue("region", auto);
+      }
       return [truncateToWidth(theme.fg("accent", theme.bold("Voice settings")), width), "", ...list.render(width)];
     },
     handleInput(data: string): void {

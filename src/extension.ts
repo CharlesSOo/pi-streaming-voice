@@ -10,6 +10,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { levelOf, openMicrophone, renderLevel, type Microphone } from "./audio.ts";
 import { buildListenUrl, DeepgramStream } from "./deepgram.ts";
+import { measureRegions, pickRegion, type MeasureRegions } from "./region-probe.ts";
 import { BACKSPACE, HotkeyDetector } from "./hold-detector.ts";
 import { loadSettings, saveSettings, settingsPath, type VoiceSettings } from "./settings.ts";
 import { createSettingsMenu } from "./settings-menu.ts";
@@ -77,7 +78,8 @@ function isEditorInput(data: string): boolean {
   return data.startsWith("\x1b[200~") || parseKey(data) !== undefined;
 }
 
-export default function streamingVoice(pi: ExtensionAPI): void {
+/** `measure` is replaced in tests; pi calls this with `pi` only. */
+export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions = measureRegions): void {
   const path = settingsPath(getAgentDir());
   let settings: VoiceSettings = loadSettings(path);
   let tui: TUI | undefined;
@@ -88,6 +90,7 @@ export default function streamingVoice(pi: ExtensionAPI): void {
   /** The hotkey went down again while the previous take was still finishing: start once that has settled. */
   let queued = false;
   let tapNoticeShown = false;
+  let measuring = false;
 
   const detector = new HotkeyDetector({
     now: () => performance.now(),
@@ -252,7 +255,7 @@ export default function streamingVoice(pi: ExtensionAPI): void {
         },
         undefined,
         undefined,
-        buildListenUrl(settings.region),
+        buildListenUrl(settings.region === "auto" ? settings.autoPick?.region : settings.region),
       );
       t.mic = await openMicrophone({
         onAudio: (samples) => {
@@ -313,14 +316,35 @@ export default function streamingVoice(pi: ExtensionAPI): void {
     }
   }
 
-  function update(patch: Partial<VoiceSettings>): void {
-    const was = settings;
-    settings = { ...settings, ...patch };
+  function save(): void {
     try {
       saveSettings(path, settings);
     } catch (error) {
       notify(`Could not save voice settings: ${error instanceof Error ? error.message : String(error)}`, "warning");
     }
+  }
+
+  /** Auto region: measure in the background and keep the pick for the next take and the next session. */
+  async function measureAuto(): Promise<void> {
+    if (measuring || settings.region !== "auto" || !settings.enabled) return;
+    measuring = true;
+    const timings = await measure().catch(() => ({}));
+    measuring = false;
+    // A fixed region chosen meanwhile turns measuring off.
+    if (settings.region !== "auto") return;
+    const pick = pickRegion(timings);
+    // Every host failed (offline): keep the last good pick rather than falling back to Global.
+    if (pick.ms === undefined && settings.autoPick) return;
+    settings = { ...settings, autoPick: pick };
+    save();
+    render();
+  }
+
+  function update(patch: Partial<VoiceSettings>): void {
+    const was = settings;
+    settings = { ...settings, ...patch };
+    save();
+    if (was.region !== "auto" || !was.enabled) void measureAuto();
     const rebound = settings.hotkey !== was.hotkey || settings.mode !== was.mode;
     if (rebound || !settings.enabled) {
       // Whatever is recording was started under the old settings.
@@ -334,6 +358,7 @@ export default function streamingVoice(pi: ExtensionAPI): void {
   pi.on("session_start", (_event, ctx) => {
     if (!ctx.hasUI) return;
     ctxRef = ctx;
+    void measureAuto();
     ctx.ui.setWidget(WIDGET_KEY, (ui, th) => {
       tui = ui;
       theme = th;

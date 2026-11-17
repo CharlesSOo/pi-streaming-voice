@@ -327,7 +327,7 @@ test("/voice with no key says how to set it, whichever way the toggle goes", asy
 test("/voice toggles and persists, keeping the other settings", async () => {
   const rig = makeRig();
   await rig.command();
-  assert.deepEqual(rig.savedSettings(), { enabled: false, hotkey: "space", mode: "hold", region: "global" });
+  assert.deepEqual(rig.savedSettings(), { enabled: false, hotkey: "space", mode: "hold", region: "auto" });
   assert.equal(rig.notifications.at(-1)?.message, "Streaming voice off");
   await rig.command();
   assert.equal(rig.notifications.at(-1)?.message, "Streaming voice on: hold space to talk, release to stop");
@@ -338,7 +338,7 @@ test("/voice toggles and persists, keeping the other settings", async () => {
 test("/voice-settings shows the four rows and saves a captured hotkey", async () => {
   const rig = makeRig();
   const closed = rig.command("voice-settings");
-  for (const row of [/Voice\s+on/, /Hotkey\s+space/, /Mode\s+hold/, /Region\s+Global/]) assert.match(rig.screen(), row);
+  for (const row of [/Voice\s+on/, /Hotkey\s+space/, /Mode\s+hold/, /Region\s+Auto$/m]) assert.match(rig.screen(), row);
   rig.feed(DOWN);
   rig.feed(ENTER);
   assert.match(rig.screen(), /Press the key you want/);
@@ -350,7 +350,7 @@ test("/voice-settings shows the four rows and saves a captured hotkey", async ()
   assert.match(rig.screen(), /ctrl\+l is already used by pi for app\.model\.select/);
   rig.feed("\x1b[107;9u"); // super+k
   assert.match(rig.screen(), /Hotkey\s+super\+k/);
-  assert.deepEqual(rig.savedSettings(), { enabled: true, hotkey: "super+k", mode: "hold", region: "global" });
+  assert.deepEqual(rig.savedSettings(), { enabled: true, hotkey: "super+k", mode: "hold", region: "auto" });
   rig.feed(ESCAPE);
   await closed;
   assert.equal(rig.focused, rig.editor);
@@ -383,12 +383,12 @@ test("/voice-settings: tap on Space asks for a combo; cancelling stays on hold",
   rig.feed(ALT_V);
   assert.match(rig.screen(), /Hotkey\s+alt\+v/);
   assert.match(rig.screen(), /Mode\s+tap/);
-  assert.deepEqual(rig.savedSettings(), { enabled: true, hotkey: "alt+v", mode: "tap", region: "global" });
+  assert.deepEqual(rig.savedSettings(), { enabled: true, hotkey: "alt+v", mode: "tap", region: "auto" });
   // Going back to Space takes the mode back to hold.
   rig.feed("\x1b[A");
   rig.feed(ENTER);
   rig.feed(" ");
-  assert.deepEqual(rig.savedSettings(), { enabled: true, hotkey: "space", mode: "hold", region: "global" });
+  assert.deepEqual(rig.savedSettings(), { enabled: true, hotkey: "space", mode: "hold", region: "auto" });
   assert.match(rig.screen(), /Mode\s+hold/);
 });
 
@@ -396,13 +396,61 @@ test("/voice-settings: the region picks the host of the next take", async () => 
   const rig = makeRig();
   void rig.command("voice-settings");
   for (let i = 0; i < 3; i += 1) rig.feed(DOWN);
-  for (let i = 0; i < 3; i += 1) rig.feed(ENTER); // Global → EU → Australia → India
+  for (let i = 0; i < 4; i += 1) rig.feed(ENTER); // Auto → Global → EU → Australia → India
   assert.match(rig.screen(), /Region\s+India/);
   rig.feed(ESCAPE);
   assert.deepEqual(rig.savedSettings(), { enabled: true, hotkey: "space", mode: "hold", region: "in" });
   await startTake(rig);
   assert.match(rig.socket().url, /^wss:\/\/api\.in\.deepgram\.com\/v1\/listen\?/);
   rig.shutdown();
+});
+
+test("auto region: a new session measures in the background, caches the pick and uses it for the next take", async () => {
+  const rig = makeRig({ timings: { global: [300, 310, 290], eu: [200, 210, 220], au: [undefined], in: [150, 140, 130] } });
+  await sleep(5);
+  assert.deepEqual(rig.savedSettings(), { enabled: true, hotkey: "space", mode: "hold", region: "auto", autoPick: { region: "in", ms: 140 } });
+  void rig.command("voice-settings");
+  assert.match(rig.screen(), /Region\s+Auto \(India, 140 ms\)/);
+  rig.feed(ESCAPE);
+  await startTake(rig);
+  assert.match(rig.socket().url, /^wss:\/\/api\.in\.deepgram\.com\/v1\/listen\?/);
+  rig.shutdown();
+});
+
+test("auto region: the cached pick is used from the start; before any measurement, Global", async () => {
+  const cached = makeRig({ settings: { region: "auto", autoPick: { region: "eu", ms: 90 } } });
+  await startTake(cached);
+  assert.match(cached.socket().url, /^wss:\/\/api\.eu\.deepgram\.com\//);
+  cached.shutdown();
+  const fresh = makeRig();
+  await startTake(fresh);
+  assert.match(fresh.socket().url, /^wss:\/\/api\.deepgram\.com\//);
+  fresh.shutdown();
+});
+
+test("auto region: a measurement where every host failed keeps the cached pick", async () => {
+  const rig = makeRig({ settings: { region: "auto", autoPick: { region: "in", ms: 140 } }, timings: { global: [undefined], eu: [undefined], au: [undefined], in: [undefined] } });
+  await sleep(5);
+  assert.deepEqual(rig.savedSettings(), { region: "auto", autoPick: { region: "in", ms: 140 } });
+  await startTake(rig);
+  assert.match(rig.socket().url, /^wss:\/\/api\.in\.deepgram\.com\//);
+  rig.shutdown();
+});
+
+test("auto region: a fixed region is not measured, and choosing Auto in the menu measures", async () => {
+  const rig = makeRig({ settings: { region: "eu" }, timings: { global: [50, 50, 50] } });
+  await sleep(5);
+  assert.deepEqual(rig.savedSettings(), { region: "eu" }, "nothing measured, nothing written");
+  void rig.command("voice-settings");
+  for (let i = 0; i < 3; i += 1) rig.feed(DOWN);
+  for (let i = 0; i < 4; i += 1) rig.feed(ENTER); // EU → Australia → India → Auto → Global: passing through Auto starts a measurement
+  await sleep(5);
+  assert.deepEqual(rig.savedSettings(), { enabled: true, hotkey: "space", mode: "hold", region: "global" }, "a measurement that lands on a fixed region is dropped");
+  for (let i = 0; i < 4; i += 1) rig.feed(ENTER); // → EU → Australia → India → Auto
+  assert.match(rig.screen(), /Region\s+Auto$/m);
+  await sleep(5);
+  assert.match(rig.screen(), /Region\s+Auto \(Global, 50 ms\)/);
+  assert.deepEqual(rig.savedSettings(), { enabled: true, hotkey: "space", mode: "hold", region: "auto", autoPick: { region: "global", ms: 50 } });
 });
 
 // ---------------------------------------------------------------- combo hotkey
