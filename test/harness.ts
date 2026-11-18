@@ -150,10 +150,17 @@ export interface Rig {
   recorder(): FakeRecorder;
   text(): string;
   savedSettings(): unknown;
+  /** The settings file. */
+  settingsFile: string;
+  /** One abort signal per Auto region measurement started. */
+  probes: AbortSignal[];
 }
 
-/** `timings`: what the Auto region measurement returns; left out, it never finishes. `settings`: the settings file to start with. */
-export function makeRig(opts: { kitty?: boolean; timings?: Timings; settings?: object } = {}): Rig {
+/**
+ * `timings`: what the Auto region measurement returns (a promise to answer later); left out, it never finishes.
+ * `settings`: the settings file to start with.
+ */
+export function makeRig(opts: { kitty?: boolean; timings?: Timings | Promise<Timings>; settings?: object } = {}): Rig {
   const agentDir = mkdtempSync(join(tmpdir(), "psv-agent-"));
   if (opts.settings) writeFileSync(join(agentDir, "pi-streaming-voice.json"), JSON.stringify(opts.settings));
   process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -169,7 +176,8 @@ export function makeRig(opts: { kitty?: boolean; timings?: Timings; settings?: o
   const commands = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
   let listener: ((data: string) => { consume?: boolean; data?: string } | undefined) | undefined;
 
-  const rig = { notifications: [], overlay: false, focused: undefined } as unknown as Rig;
+  const rig = { notifications: [], overlay: false, focused: undefined, probes: [] } as unknown as Rig;
+  rig.settingsFile = join(agentDir, "pi-streaming-voice.json");
   const tui = {
     requestRender: () => {},
     hasOverlay: () => rig.overlay,
@@ -216,7 +224,10 @@ export function makeRig(opts: { kitty?: boolean; timings?: Timings; settings?: o
     },
   };
   const timings = opts.timings;
-  streamingVoice(pi as unknown as ExtensionAPI, () => (timings ? Promise.resolve(timings) : new Promise<Timings>(() => {})));
+  streamingVoice(pi as unknown as ExtensionAPI, (signal) => {
+    if (signal) rig.probes.push(signal);
+    return timings ? Promise.resolve(timings) : new Promise<Timings>(() => {});
+  });
   handlers.get("session_start")?.({}, ctx);
 
   rig.feed = (data) => {

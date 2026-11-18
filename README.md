@@ -57,7 +57,7 @@ the toggle goes.
 
 Opens a menu with four rows. Changes apply immediately and are saved, with the `/voice` toggle, in
 `~/.pi/agent/pi-streaming-voice.json` as `{enabled, hotkey, mode, region}` (plus `autoPick`, the region Auto last
-measured as fastest).
+measured as fastest, its connect time and when it was measured).
 
 | Row | Values | Default |
 |---|---|---|
@@ -115,12 +115,15 @@ A regional host keeps processing in that region and does not fall back to anothe
 nearer region shortens the wait for the first words: measured from Southeast Asia, the connection opened in
 1.8–2.1 s on Global and 1.0–1.1 s on India, with the same transcript.
 
-**Auto** finds the nearest one for you. When a pi session starts, it times a connection to each of the four hosts
-in the background (three tries each, taking the median) and uses the fastest; a host that fails or does not answer
-within 3 s is skipped. The pick is saved, so the next session starts with it right away, and the menu shows it
-next to Auto, e.g. `Auto (India, 140 ms)`. Until the first measurement has finished, Global is used. If no host
-answers (for example offline), the last saved pick is kept. A take that is already running stays on its host. The measurement only opens a TLS connection and
-drops it: it sends no API key and no audio, and costs nothing.
+**Auto** finds the nearest one for you. At most once a day it times a connection to each of the four hosts in the
+background (three tries each, taking the median) and uses the fastest; a host that fails or does not answer within
+3 s is skipped. The pick is saved with the time it was measured, and the menu shows it next to Auto, e.g.
+`Auto (India, 140 ms)`. A pi session that starts (or voice being turned on) within 24 hours of the last measurement
+uses the saved pick and opens no connection at all; after that it measures again. Choosing Auto in the menu
+measures at once. Until the first measurement has finished, Global is used. If no host answers (for example
+offline), the last saved pick is kept and the next session tries again. A take that is already running stays on
+its host. The measurement only opens a TLS connection and drops it: it sends no API key and no audio, and costs
+nothing.
 
 **Auto may send your audio to any of the four regions.** If processing has to stay in one region, choose that
 region explicitly; a fixed region is never measured and never changes.
@@ -131,25 +134,44 @@ Hold mode is driven by the OS auto-repeat of the held key: the repeats are what 
 OS key repeat has to be on** (macOS: System Settings → Keyboard → Key repeat rate, not "Off"). With it off, a held
 Space just types one space and a held combo records for 2 s; use tap mode with a combo instead.
 
+**How fast the key has to repeat.** In kitty keyboard protocol terminals a hold survives repeat intervals up to
+500 ms, so any macOS setting works. In other terminals (the repeat-timing path, and a combo working as tap) the
+repeats have to come at most 125 ms apart: leave macOS "Key repeat rate" at its default or faster. The slowest
+settings repeat more slowly than that, and a held Space then just types spaces.
+
 Space is the only hotkey that also types:
 
 - **Kitty keyboard protocol terminals** (key-release events): the press types a space. Its first auto-repeat makes
   it a hold: the space is removed and recording starts, so recording starts after your OS "delay until repeat". The
   release event stops it. A tap, or typing another key while Space is down, leaves an ordinary space. Text that
-  merely contains spaces (a paste, text injected by another tool) never records: a second space sooner than 120 ms
-  after the first is text, not a repeat. The release counts whatever modifiers are down by then (Shift for the next
-  capital, Caps Lock). This path is used once pi has negotiated the protocol *and* a key-release event has actually
-  been seen.
+  merely contains spaces (a paste, text injected by another tool) does not record: spaces sooner than 120 ms after
+  the first are typed as text, not taken as repeats. If spaces are still coming 120 ms after the press, it was a
+  held key whose first repeats arrived early (pi was busy and processed them late, close together): recording
+  starts and every space typed since the press is removed. The release counts whatever modifiers are down by then
+  (Shift for the next capital, Caps Lock). This path is used once pi has negotiated the protocol *and* a
+  key-release event has actually been seen.
 - **Other terminals** (only auto-repeat): three consecutive spaces at most 125 ms apart (auto-repeat) mean a hold;
   the spaces typed while detecting — including the original press, if it came at most 650 ms before the first
   repeat — are removed. Recording stops when the repeats stop (below), or when another key is pressed.
 
 A combo starts recording on the press and stops on the release.
 
-On every path a hold also ends when its repeats stop for max(500 ms, 2.5 × the repeat interval), and a combo hold
-ends if no repeat or release follows the press within 2 s. So a release that never arrives (focus moved away
-mid-hold) cannot leave the microphone open. If it was only a stall and the key is still down, the next repeat
-starts a new take at once, so at most the words spoken during the stall are lost.
+On every path a hold also ends when its repeats stop for max(500 ms, 2.5 × the repeat interval; intervals over
+250 ms are not counted, so at most 625 ms), and a combo hold ends if no repeat or release follows the press within
+2 s. So a release that never arrives (focus moved away mid-hold) cannot leave the microphone open. If it was only
+a stall and the key is still down, the next repeat starts a new take at once, so at most the words spoken during
+the stall are lost.
+
+Known limits:
+
+1. In a kitty-protocol terminal, a space that arrives with no release event (text injected by another tool)
+   followed by a second space 120 ms to 2 s later looks like a held key: a take starts, both spaces are removed,
+   and it records for about 500 ms until the missing repeats end it.
+2. For 2 s after a recording was cut because the release was lost, the next Space starts a recording instead of
+   typing a space.
+
+The indicator needs room on the editor's top border: in a terminal narrower than about 20 columns it is not drawn,
+though recording works.
 
 `listening…` appears once the microphone is delivering audio (`starting…` until then, typically 150 ms): start
 talking when you see it.

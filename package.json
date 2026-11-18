@@ -1,6 +1,6 @@
 {
   "name": "pi-streaming-voice",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Push-to-talk streaming voice input for pi, using Deepgram Nova-3",
   "type": "module",
   "license": "MIT",
@@ -21,7 +21,7 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "npm run check && node --experimental-test-module-mocks --test test/*.test.ts"
+    "test": "npm run check && node --experimental-test-module-mocks --test --test-timeout=20000 test/*.test.ts"
   },
   "pi": {
     "extensions": [

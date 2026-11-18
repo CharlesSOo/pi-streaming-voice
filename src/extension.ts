@@ -20,6 +20,8 @@ export const COMMAND = "voice";
 export const SETTINGS_COMMAND = "voice-settings";
 const WIDGET_KEY = "pi-streaming-voice";
 const KEY_ENV = "DEEPGRAM_API_KEY";
+/** Auto region: a pick older than this is measured again. */
+const AUTO_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const KEY_HELP = `Set ${KEY_ENV} in your environment, e.g. fish: set -Ux ${KEY_ENV} <your-key>  (bash/zsh: export ${KEY_ENV}=<your-key>), then restart pi.`;
 
 /** The editor surface we use: pi-tui's Editor (and CustomEditor subclasses). */
@@ -92,7 +94,8 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
   /** The hotkey went down again while the previous take was still finishing: start once that has settled. */
   let queued = false;
   let tapNoticeShown = false;
-  let measuring = false;
+  /** The Auto region measurement in flight, if any. */
+  let probe: AbortController | undefined;
 
   const detector = new HotkeyDetector({
     now: () => performance.now(),
@@ -146,7 +149,7 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
     decorated.add(editor);
     const own = Object.getOwnPropertyDescriptor(editor, "render");
     const base = editor.render.bind(editor);
-    editor.render = (width) => {
+    const wrapper = (width: number): string[] => {
       const lines = base(width);
       const t = take;
       const top = lines[0];
@@ -159,7 +162,10 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
       lines[0] = `${sliceByColumn(top, 0, keep)} ${text} ${sliceByColumn(top, width - 1, 1)}\x1b[0m`;
       return lines;
     };
+    editor.render = wrapper;
     restoreEditors.push(() => {
+      // Something else has wrapped the editor since: leave it, ours draws nothing without a take.
+      if (editor.render !== wrapper) return;
       decorated.delete(editor);
       if (own) Object.defineProperty(editor, "render", own);
       else delete (editor as { render?: unknown }).render;
@@ -330,6 +336,8 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
     unsubscribe = undefined;
     detector.dispose();
     queued = false;
+    probe?.abort();
+    probe = undefined;
     for (const restore of restoreEditors.splice(0)) restore();
     const t = take;
     take = undefined;
@@ -349,19 +357,33 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
     }
   }
 
-  /** Auto region: measure in the background and keep the pick for the next take and the next session. */
-  async function measureAuto(): Promise<void> {
-    if (measuring || settings.region !== "auto" || !settings.enabled) return;
-    measuring = true;
-    const timings = await measure().catch(() => ({}));
-    measuring = false;
+  /**
+   * Auto region: measure in the background, at most once a day unless `force`d, and keep the pick for the next
+   * take and the next sessions.
+   */
+  async function measureAuto(force = false): Promise<void> {
+    if (probe || settings.region !== "auto" || !settings.enabled) return;
+    const age = Date.now() - (settings.autoPick?.at ?? -Infinity);
+    if (!force && age >= 0 && age < AUTO_MAX_AGE_MS) return;
+    const mine = new AbortController();
+    probe = mine;
+    const timings = await measure(mine.signal).catch(() => ({}));
+    // Shut down meanwhile: the result is dropped.
+    if (mine.signal.aborted) return;
+    probe = undefined;
+    const found = pickRegion(timings);
+    // Every host failed (offline): keep the last good pick and its age, so the next session tries again.
+    if (found.ms === undefined && settings.autoPick) return;
+    const autoPick = found.ms === undefined ? found : { ...found, at: Date.now() };
     // A fixed region chosen meanwhile turns measuring off.
-    if (settings.region !== "auto") return;
-    const pick = pickRegion(timings);
-    // Every host failed (offline): keep the last good pick rather than falling back to Global.
-    if (pick.ms === undefined && settings.autoPick) return;
-    settings = { ...settings, autoPick: pick };
-    save();
+    if (settings.region === "auto") settings = { ...settings, autoPick };
+    try {
+      // The file may be newer than this instance (after /reload, or another pi): change only the pick in it.
+      const file = loadSettings(path);
+      if (file.region === "auto") saveSettings(path, { ...file, autoPick });
+    } catch (error) {
+      notify(`Could not save voice settings: ${error instanceof Error ? error.message : String(error)}`, "warning");
+    }
     render();
   }
 
@@ -369,7 +391,9 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
     const was = settings;
     settings = { ...settings, ...patch };
     save();
-    if (was.region !== "auto" || !was.enabled) void measureAuto();
+    // Choosing Auto measures at once; turning voice on only if the pick is a day old.
+    if (was.region !== "auto") void measureAuto(true);
+    else if (!was.enabled) void measureAuto();
     const rebound = settings.hotkey !== was.hotkey || settings.mode !== was.mode;
     if (rebound || !settings.enabled) {
       // Whatever is recording was started under the old settings.

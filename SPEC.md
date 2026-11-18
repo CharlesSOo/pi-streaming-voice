@@ -38,7 +38,7 @@ Nova-3 streaming STT instead of Anthropic's private endpoint.
 
 ## /voice-settings (0.2.0)
 - Menu with four rows: Voice (on/off), Hotkey, Mode (hold/tap), Region.
-- Persist in `~/.pi/agent/pi-streaming-voice.json` as `{enabled, hotkey, mode, region}`. Defaults: `hotkey: "space"`,
+- Persist in `~/.pi/agent/pi-streaming-voice.json` as `{enabled, hotkey, mode, region}` (plus `autoPick`, see "Region: Auto"). Defaults: `hotkey: "space"`,
   `mode: "hold"`, `region: "auto"` (0.2.1; was `"global"`). A file that only has `enabled` loads with those defaults.
 
 ### Hotkey
@@ -62,19 +62,24 @@ Nova-3 streaming STT instead of Anthropic's private endpoint.
   with a one-time notice.
 
 ### Region
-- Global (`api.deepgram.com`, default), EU (`api.eu.deepgram.com`), Australia (`api.au.deepgram.com`), India
+- Global (`api.deepgram.com`, the default until 0.2.1), EU (`api.eu.deepgram.com`), Australia (`api.au.deepgram.com`), India
   (`api.in.deepgram.com`). Same key and paths; only the host changes. The next take uses the chosen host.
 
 ### Region: Auto (0.2.1)
 - Region gains `auto`, the default: Auto, Global, EU, Australia, India. A settings file without `region` loads as
   `auto`.
-- With `auto`, at session start (and when Auto is chosen or voice is turned on) the extension times a connection to
-  each of the four hosts in the background: three tries per host, median, 3 s timeout per try. It never blocks
-  startup or a take. The fastest host is used. A host with a failed or timed-out try is skipped; if none is left,
-  the last cached pick is kept, or Global when there is none.
-- The pick is cached in the settings file as `autoPick: {region, ms}` (no `ms` when no host answered), so the next
-  session starts with it; until the first measurement finishes, Global is used. A take in progress never changes
-  host.
+- With `auto`, the extension times a connection to each of the four hosts in the background: three tries per host,
+  median, 3 s timeout per try. It never blocks startup or a take. The fastest host is used. A host with a failed or
+  timed-out try is skipped; if none is left, the last cached pick is kept, or Global when there is none.
+- The pick is cached in the settings file as `autoPick: {region, ms, at}` (`at`: epoch ms of the measurement; no
+  `ms` and no `at` when no host answered), so the next session starts with it; until the first measurement
+  finishes, Global is used. A take in progress never changes host.
+- 0.2.3: measured at most once a day. At session start, and when voice is turned on, it measures only if there is
+  no pick or the pick is older than 24 hours (a pick without `at` counts as stale); otherwise no connection is
+  made. Choosing Auto in `/voice-settings` measures at once. A measurement where every host failed leaves the pick
+  and its `at` as they were, so the next session tries again.
+- 0.2.3: a result re-reads the settings file and changes only `autoPick` in it, and only if the file still says
+  region `auto`. Session shutdown destroys the sockets of a measurement in flight and drops its result.
 - `/voice-settings` shows the pick next to Auto, e.g. `Auto (India, 140 ms)`.
 - Choosing a fixed region turns measuring off; so does turning voice off.
 - The probe times a TCP+TLS connect to port 443 and drops the connection: no HTTP request, no API key, no stream.
@@ -95,9 +100,17 @@ Nova-3 streaming STT instead of Anthropic's private endpoint.
 - Hold mode is driven by the OS auto-repeat of the held key, which must be on (with it off: tap mode with a combo).
   A take in hold mode never keeps the mic open when no key is held, and is not cut while the key is still down.
 - Kitty path, Space: the press types a space; the first auto-repeat (plain `" "` as in Rex, or encoded) within 2 s
-  starts the take and removes that space; the release ends it. A second plain space sooner than 120 ms after the
-  first is text, not a repeat. So text that is not a held key (`word ` injected with no release, two spaces a few ms
-  apart) never records and its spaces stay. This replaces the 350 ms threshold.
+  starts the take and removes that space; the release ends it. A plain space sooner than 120 ms after the press is
+  typed as text, not taken as a repeat. So text that is not a held key (`word ` injected with no release, two or
+  three spaces a few ms apart) never records and its spaces stay. This replaces the 350 ms threshold.
+- 0.2.3: the 120 ms count from the press, not from the previous space. When the press and its first repeats are
+  processed close together (busy event loop), the hold starts at the first plain space at least 120 ms after the
+  press, and every space typed since the press is removed. A release or any other key resets this.
+- Key repeat speed: the kitty path tolerates repeat intervals up to 500 ms; the repeat-timing path and the tap
+  fallback need at most 125 ms.
+- Known limits: without release events, a second space 120 ms to 2 s after an unreleased one looks like a hold and
+  records for about 500 ms; for 2 s after a recording was cut for a lost release, the next Space starts a recording
+  instead of typing a space.
 - Watchdog: every hold ends when no repeat arrives for max(500 ms, 2.5 × the repeat interval), armed from the first
   repeat. A combo hold (which starts on the press) ends if neither a repeat nor a release follows within 2 s.
 - Resume: if the watchdog cut a kitty-path take (Space or combo) and a repeat of the hotkey arrives within 2 s with

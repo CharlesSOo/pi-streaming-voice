@@ -8,8 +8,11 @@
  * Space (the only hotkey that also types) is always hold-to-talk, on two paths:
  *  - Kitty: the terminal reports key releases (pi-tui requests flags 7). The
  *    press types a space; the first auto-repeat (plain or encoded) makes it a
- *    hold: the typed space is removed and recording starts. A second plain
- *    space sooner than any OS initial repeat delay (`textGapMs`) is text.
+ *    hold: the typed space is removed and recording starts. A plain space
+ *    sooner after the press than any OS initial repeat delay (`textGapMs`) is
+ *    typed as text; if the spaces keep coming past that delay it was a hold
+ *    after all (the press and its first repeats were processed late, close
+ *    together), and every space typed since the press is removed.
  *  - Repeat timing (no release events): a run of `repeatCount` consecutive
  *    gaps of at most `repeatGapMs` is a hold; the spaces typed so far are
  *    removed.
@@ -30,7 +33,7 @@ import { isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
 import { classifyHotkey, DEFAULT_HOTKEY, isCombo, splitKeyId, type HotkeyEvent, type KeyParts, type VoiceMode } from "./hotkey.ts";
 
 export interface HoldThresholds {
-  /** Kitty, Space: a second plain space sooner than this after the first is text, not an auto-repeat. */
+  /** Kitty, Space: a plain space sooner than this after the press is text, not (yet) an auto-repeat. */
   textGapMs: number;
   /** Longest OS initial repeat delay: a held key has repeated by then. */
   noRepeatMs: number;
@@ -94,8 +97,9 @@ export class HotkeyDetector {
   // Timing of hotkey events during a hold.
   private lastAt = -Infinity;
   private interval = 0;
-  /** Kitty path: when the last plain space was typed; a repeat of it makes a hold. */
+  /** Kitty path: when the Space that may become a hold was pressed, and the spaces typed since (it included). */
   private pressAt = -Infinity;
+  private typed = 0;
   /** When the repeats of a kitty-path hold stopped without a release: more repeats soon after resume it. */
   private cutAt = -Infinity;
   /** Tap: the last hotkey press, and whether the key was released since. */
@@ -242,6 +246,7 @@ export class HotkeyDetector {
 
     if (event === "release") {
       this.pressAt = -Infinity;
+      this.typed = 0;
       this.cutAt = -Infinity;
       return undefined;
     }
@@ -254,20 +259,27 @@ export class HotkeyDetector {
       return CONSUME;
     }
     const gap = now - this.pressAt;
-    // An encoded repeat is one for certain; a plain space is one if it comes no sooner than an OS initial delay.
-    if (gap <= this.t.noRepeatMs && (event === "repeat" || gap >= this.t.textGapMs)) {
-      this.deps.deleteSpaces(1);
-      this.startHeld(now, this.releaseGap());
-      return CONSUME;
+    if (gap <= this.t.noRepeatMs) {
+      // An encoded repeat is one for certain; a plain space is one if it comes no sooner than an OS initial delay.
+      if (event === "repeat" || gap >= this.t.textGapMs) {
+        this.deps.deleteSpaces(this.typed);
+        this.startHeld(now, this.releaseGap());
+        return CONSUME;
+      }
+      // Too soon to tell text from a press whose repeats were processed late: typed for now, counted from the press.
+      this.typed += 1;
+      return undefined;
     }
     if (event === "repeat") return CONSUME; // stray repeat, nothing to do
     this.pressAt = now;
+    this.typed = 1;
     return undefined; // the press types its space
   }
 
   /** The key is down on the kitty path: record until its release, or until `watchdogMs` pass without a repeat. */
   private startHeld(now: number, watchdogMs: number): void {
     this.pressAt = -Infinity;
+    this.typed = 0;
     this.cutAt = -Infinity;
     this.lastAt = now;
     this.interval = 0;
@@ -365,6 +377,7 @@ export class HotkeyDetector {
     this.lastAt = -Infinity;
     this.interval = 0;
     this.pressAt = -Infinity;
+    this.typed = 0;
     this.cutAt = -Infinity;
   }
 

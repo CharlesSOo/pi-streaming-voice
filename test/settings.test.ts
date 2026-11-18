@@ -40,6 +40,9 @@ test("the cached auto pick round-trips; a broken one is dropped", () => {
   const path = fileWith("{}");
   saveSettings(path, { ...DEFAULT_SETTINGS, autoPick: { region: "in", ms: 140 } });
   assert.deepEqual(loadSettings(path), { ...DEFAULT_SETTINGS, autoPick: { region: "in", ms: 140 } });
+  saveSettings(path, { ...DEFAULT_SETTINGS, autoPick: { region: "in", ms: 140, at: 1_800_000_000_000 } });
+  assert.deepEqual(loadSettings(path), { ...DEFAULT_SETTINGS, autoPick: { region: "in", ms: 140, at: 1_800_000_000_000 } });
+  assert.deepEqual(loadSettings(fileWith('{"autoPick": {"region": "in", "ms": 140, "at": "today"}}')), { ...DEFAULT_SETTINGS, autoPick: { region: "in", ms: 140 } });
   assert.deepEqual(loadSettings(fileWith('{"autoPick": {"region": "global"}}')), { ...DEFAULT_SETTINGS, autoPick: { region: "global" } });
   assert.deepEqual(loadSettings(fileWith('{"autoPick": {"region": "mars", "ms": 1}}')), DEFAULT_SETTINGS);
   assert.deepEqual(loadSettings(fileWith('{"autoPick": "in"}')), DEFAULT_SETTINGS);

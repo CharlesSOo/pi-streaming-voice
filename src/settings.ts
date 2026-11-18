@@ -13,7 +13,7 @@ export interface VoiceSettings {
   mode: VoiceMode;
   /** Which Deepgram host takes connect to; `auto` uses the fastest one measured. */
   region: Region | "auto";
-  /** What `auto` last measured as fastest, kept so the next session starts with it. */
+  /** What `auto` last measured as fastest and when, kept so the next sessions start with it. */
   autoPick?: AutoPick;
 }
 
@@ -29,14 +29,15 @@ export function loadSettings(path: string): VoiceSettings {
     const checked = checkHotkey(typeof parsed.hotkey === "string" ? parsed.hotkey : undefined);
     const hotkey = checked.ok ? checked.hotkey : DEFAULT_SETTINGS.hotkey;
     const isRegion = (value: unknown): value is Region => typeof value === "string" && Object.hasOwn(REGION_HOSTS, value);
-    const pick = parsed.autoPick as { region?: unknown; ms?: unknown } | null | undefined;
+    const pick = parsed.autoPick as { region?: unknown; ms?: unknown; at?: unknown } | null | undefined;
+    const num = (value: unknown) => typeof value === "number";
     return {
       enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : DEFAULT_SETTINGS.enabled,
       hotkey,
       // Tap needs a combo: a tapped Space has to stay a space.
       mode: parsed.mode === "tap" && hotkey !== DEFAULT_HOTKEY ? "tap" : "hold",
       region: isRegion(parsed.region) ? parsed.region : DEFAULT_SETTINGS.region,
-      ...(pick && isRegion(pick.region) && { autoPick: { region: pick.region, ...(typeof pick.ms === "number" && { ms: pick.ms }) } }),
+      ...(pick && isRegion(pick.region) && { autoPick: { region: pick.region, ...(num(pick.ms) && { ms: pick.ms as number }), ...(num(pick.at) && { at: pick.at as number }) } }),
     };
   } catch {
     return { ...DEFAULT_SETTINGS };

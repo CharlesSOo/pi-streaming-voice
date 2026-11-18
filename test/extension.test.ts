@@ -2,6 +2,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import { readFileSync, writeFileSync } from "node:fs";
+import type { Timings } from "../src/region-probe.ts";
 import { activeTimers, ALT_V, ALT_V_RELEASE, FakeSocket, makeRig, mic, sleep, TEST_KEY, type Rig } from "./harness.ts";
 
 const tick = () => sleep(5);
@@ -439,7 +441,8 @@ test("/voice-settings: the region picks the host of the next take", async () => 
 test("auto region: a new session measures in the background, caches the pick and uses it for the next take", async () => {
   const rig = makeRig({ timings: { global: [300, 310, 290], eu: [200, 210, 220], au: [undefined], in: [150, 140, 130] } });
   await sleep(5);
-  assert.deepEqual(rig.savedSettings(), { enabled: true, hotkey: "space", mode: "hold", region: "auto", autoPick: { region: "in", ms: 140 } });
+  const saved = rig.savedSettings() as { autoPick: { at: number } };
+  assert.deepEqual({ ...saved, autoPick: { ...saved.autoPick, at: 0 } }, { enabled: true, hotkey: "space", mode: "hold", region: "auto", autoPick: { region: "in", ms: 140, at: 0 } });
   void rig.command("voice-settings");
   assert.match(rig.screen(), /Region\s+Auto \(India, 140 ms\)/);
   rig.feed(ESCAPE);
@@ -481,7 +484,138 @@ test("auto region: a fixed region is not measured, and choosing Auto in the menu
   assert.match(rig.screen(), /Region\s+Auto$/m);
   await sleep(5);
   assert.match(rig.screen(), /Region\s+Auto \(Global, 50 ms\)/);
-  assert.deepEqual(rig.savedSettings(), { enabled: true, hotkey: "space", mode: "hold", region: "auto", autoPick: { region: "global", ms: 50 } });
+  const saved = rig.savedSettings() as { autoPick: { at: number } };
+  assert.deepEqual({ ...saved, autoPick: { ...saved.autoPick, at: 0 } }, { enabled: true, hotkey: "space", mode: "hold", region: "auto", autoPick: { region: "global", ms: 50, at: 0 } });
+  rig.shutdown();
+});
+
+const HOUR = 3_600_000;
+const ALL_FAILED: Timings = { global: [undefined], eu: [undefined], au: [undefined], in: [undefined] };
+const INDIA: Timings = { global: [300, 310, 290], in: [150, 140, 130] };
+
+test("auto region: a pick less than a day old is not measured again, at session start or when voice is turned on", async () => {
+  const rig = makeRig({ settings: { region: "auto", autoPick: { region: "eu", ms: 90, at: Date.now() - 23 * HOUR } }, timings: INDIA });
+  const before = readFileSync(rig.settingsFile, "utf8");
+  await sleep(5);
+  assert.equal(rig.probes.length, 0);
+  assert.equal(readFileSync(rig.settingsFile, "utf8"), before, "the file is untouched");
+  await rig.command(); // off
+  await rig.command(); // on
+  await sleep(5);
+  assert.equal(rig.probes.length, 0);
+  await startTake(rig);
+  assert.match(rig.socket().url, /^wss:\/\/api\.eu\.deepgram\.com\//);
+  rig.shutdown();
+});
+
+test("auto region: a pick older than a day, or with no time, is measured again", async () => {
+  for (const at of [Date.now() - 25 * HOUR, undefined]) {
+    const rig = makeRig({ settings: { region: "auto", autoPick: { region: "eu", ms: 90, at } }, timings: INDIA });
+    const started = Date.now();
+    await sleep(5);
+    assert.equal(rig.probes.length, 1);
+    const saved = rig.savedSettings() as { autoPick: { region: string; ms: number; at: number } };
+    assert.deepEqual({ ...saved.autoPick, at: 0 }, { region: "in", ms: 140, at: 0 });
+    assert.ok(saved.autoPick.at >= started && saved.autoPick.at <= Date.now());
+    rig.shutdown();
+  }
+});
+
+test("auto region: voice turned on with a stale pick measures", async () => {
+  const rig = makeRig({ settings: { enabled: false, region: "auto", autoPick: { region: "eu", ms: 90, at: Date.now() - 25 * HOUR } }, timings: INDIA });
+  await sleep(5);
+  assert.equal(rig.probes.length, 0, "voice is off");
+  await rig.command();
+  await sleep(5);
+  assert.equal(rig.probes.length, 1);
+  assert.equal((rig.savedSettings() as { autoPick: { region: string } }).autoPick.region, "in");
+  rig.shutdown();
+});
+
+test("auto region: choosing Auto in the menu measures even with a fresh pick", async () => {
+  const rig = makeRig({ settings: { region: "in", autoPick: { region: "eu", ms: 90, at: Date.now() - HOUR } }, timings: INDIA });
+  await sleep(5);
+  assert.equal(rig.probes.length, 0);
+  void rig.command("voice-settings");
+  for (let i = 0; i < 3; i += 1) rig.feed(DOWN);
+  rig.feed(ENTER); // India → Auto
+  await sleep(5);
+  assert.equal(rig.probes.length, 1);
+  assert.match(rig.screen(), /Region\s+Auto \(India, 140 ms\)/);
+  rig.shutdown();
+});
+
+test("auto region: a measurement where every host failed keeps the pick and its time, so the next session tries again", async () => {
+  const at = Date.now() - 25 * HOUR;
+  const rig = makeRig({ settings: { region: "auto", autoPick: { region: "in", ms: 140, at } }, timings: ALL_FAILED });
+  const before = readFileSync(rig.settingsFile, "utf8");
+  await sleep(5);
+  assert.equal(rig.probes.length, 1);
+  assert.equal(readFileSync(rig.settingsFile, "utf8"), before);
+  rig.shutdown();
+  // With no pick at all, Global is shown, without a time: still stale.
+  const none = makeRig({ timings: ALL_FAILED });
+  await sleep(5);
+  assert.deepEqual((none.savedSettings() as { autoPick: unknown }).autoPick, { region: "global" });
+  none.shutdown();
+});
+
+test("auto region: a result changes only the pick in a settings file that changed while measuring", async () => {
+  let answer!: (timings: Timings) => void;
+  const rig = makeRig({ timings: new Promise<Timings>((resolve) => (answer = resolve)) });
+  await sleep(5);
+  assert.equal(rig.probes.length, 1);
+  // Another pi (or this one before /reload) changed the hotkey and mode meanwhile.
+  writeFileSync(rig.settingsFile, JSON.stringify({ enabled: false, hotkey: "alt+v", mode: "tap", region: "auto" }));
+  answer(INDIA);
+  await sleep(5);
+  const saved = rig.savedSettings() as { autoPick: { at: number } };
+  assert.deepEqual({ ...saved, autoPick: { ...saved.autoPick, at: 0 } }, { enabled: false, hotkey: "alt+v", mode: "tap", region: "auto", autoPick: { region: "in", ms: 140, at: 0 } });
+  rig.shutdown();
+});
+
+test("auto region: a result is not written to a settings file that changed to a fixed region while measuring", async () => {
+  let answer!: (timings: Timings) => void;
+  const rig = makeRig({ timings: new Promise<Timings>((resolve) => (answer = resolve)) });
+  await sleep(5);
+  const other = JSON.stringify({ enabled: true, hotkey: "alt+v", mode: "hold", region: "eu" });
+  writeFileSync(rig.settingsFile, other);
+  answer(INDIA);
+  await sleep(5);
+  assert.equal(readFileSync(rig.settingsFile, "utf8"), other);
+  rig.shutdown();
+});
+
+test("auto region: shutdown aborts the measurement and its late result is dropped", async () => {
+  let answer!: (timings: Timings) => void;
+  const rig = makeRig({ settings: { region: "auto", hotkey: "alt+v" }, timings: new Promise<Timings>((resolve) => (answer = resolve)) });
+  const before = readFileSync(rig.settingsFile, "utf8");
+  await sleep(5);
+  assert.equal(rig.probes[0]?.aborted, false);
+  rig.shutdown();
+  assert.equal(rig.probes[0]?.aborted, true);
+  answer(INDIA);
+  await sleep(5);
+  assert.equal(readFileSync(rig.settingsFile, "utf8"), before);
+});
+
+// ---------------------------------------------------------------- editor render
+
+test("shutdown takes our render wrapper off the editor, but leaves a wrapper someone else put on top", async () => {
+  const plain = makeRig();
+  await finishNormally(await startTake(plain));
+  assert.ok(Object.hasOwn(plain.editor, "render"), "decorated by the take");
+  plain.shutdown();
+  assert.ok(!Object.hasOwn(plain.editor, "render"), "back to the editor's own render");
+
+  const rig = makeRig();
+  await finishNormally(await startTake(rig));
+  const ours = rig.editor.render;
+  const theirs = (width: number): string[] => ours(width);
+  rig.editor.render = theirs;
+  rig.shutdown();
+  assert.equal(rig.editor.render, theirs);
+  assert.deepEqual(rig.editor.render(40), Object.getPrototypeOf(rig.editor).render.call(rig.editor, 40), "ours is inert without a take");
 });
 
 // ---------------------------------------------------------------- combo hotkey

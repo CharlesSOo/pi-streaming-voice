@@ -236,6 +236,58 @@ test("kitty path: two spaces a few ms apart with no release are text", () => {
   assert.deepEqual(h.log, []);
 });
 
+test("kitty path: repeats processed 40, 70, 100, 130 ms after the press start the hold at 130 ms, no spaces left", () => {
+  const h = kittyHarness();
+  assert.equal(h.send(PRESS), undefined);
+  assert.equal(h.send(PRESS, 40), undefined);
+  assert.equal(h.send(PRESS, 30), undefined);
+  assert.equal(h.send(PRESS, 30), undefined);
+  assert.deepEqual(h.log, []);
+  assert.deepEqual(h.send(PRESS, 30), { consume: true });
+  assert.deepEqual(h.log, ["delete:4", "start"]);
+  for (let i = 0; i < 10; i += 1) assert.deepEqual(h.send(PRESS, 30), { consume: true });
+  assert.deepEqual(h.send(K_RELEASE, 30), { consume: true });
+  assert.deepEqual(h.log, ["delete:4", "start", "stop"]);
+});
+
+test("kitty path: press and six repeats processed within 5 ms (blocked event loop) still become a hold", () => {
+  const h = kittyHarness();
+  assert.equal(h.send(PRESS), undefined);
+  for (let i = 0; i < 5; i += 1) assert.equal(h.send(PRESS, 1), undefined);
+  assert.equal(h.send(PRESS), undefined);
+  // The repeats go on every 30 ms: 35, 65, 95 ms after the press are typed, 125 ms is past `textGapMs`.
+  for (let i = 0; i < 3; i += 1) assert.equal(h.send(PRESS, 30), undefined);
+  assert.deepEqual(h.log, []);
+  assert.deepEqual(h.send(PRESS, 30), { consume: true });
+  assert.deepEqual(h.log, ["delete:10", "start"], "the press, six repeats and three more were typed, and all are removed");
+  assert.deepEqual(h.send(PRESS, 30), { consume: true });
+  assert.deepEqual(h.send(K_RELEASE, 30), { consume: true });
+  assert.deepEqual(h.log, ["delete:10", "start", "stop"]);
+});
+
+test("kitty path: three spaces a few ms apart and then nothing are text", () => {
+  const h = kittyHarness();
+  assert.equal(h.send(PRESS), undefined);
+  assert.equal(h.send(PRESS, 4), undefined);
+  assert.equal(h.send(PRESS, 4), undefined);
+  h.advance(60_000);
+  assert.deepEqual(h.log, []);
+  assert.equal(h.detector.phase, "idle");
+});
+
+test("kitty path: a release or another key forgets the spaces typed so far", () => {
+  const h = kittyHarness();
+  h.send(PRESS);
+  h.send(PRESS, 40);
+  assert.equal(h.send(K_RELEASE, 40), undefined);
+  assert.equal(h.send(PRESS, 60), undefined, "140 ms after the first press, but that one was released");
+  assert.equal(h.send("x", 40), undefined);
+  assert.equal(h.send(PRESS, 100), undefined, "another key came in between");
+  assert.deepEqual(h.log, []);
+  assert.deepEqual(h.send(PRESS, 300), { consume: true });
+  assert.deepEqual(h.log, ["delete:1", "start"]);
+});
+
 test("kitty path: an encoded repeat right after the press is a hold", () => {
   const h = kittyHarness();
   h.send(PRESS);

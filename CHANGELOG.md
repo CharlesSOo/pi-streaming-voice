@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.2.3] - 2026-11-18
+
+### Changed
+- Region `Auto` measures at most once a day instead of at every session start. A session that starts within 24
+  hours of the last measurement uses the saved pick and opens no connection. Choosing Auto in `/voice-settings`
+  still measures at once. The saved `autoPick` gains `at`, the time of the measurement.
+
+### Fixed
+- Holding Space while pi was busy (streaming output) could type spaces instead of recording: when the press and
+  its first repeats were processed close together, every repeat was taken for text. The hold now starts 120 ms
+  after the press and all the spaces typed since are removed.
+- An Auto measurement that finished after `/reload`, or in a second pi, could write back old settings and undo a
+  hotkey, mode or region change. A result now changes only `autoPick`, in the settings file as it is at that
+  moment, and is dropped after shutdown.
+- A measurement still connecting could hold up pi's exit for up to 3 s. Shutdown now closes its connections.
+- On shutdown the editor's `render` is put back only if it is still this extension's wrapper, so a wrapper another
+  extension added on top is not removed.
+
+### Documentation
+- README: the key-repeat speed hold detection needs, and two known limits of it.
+
 ## [0.2.2] - 2026-11-18
 
 ### Changed

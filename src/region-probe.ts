@@ -9,6 +9,8 @@ const TIMEOUT_MS = 3_000;
 export interface AutoPick {
   region: Region;
   ms?: number;
+  /** When it was measured (epoch ms). A pick without it is stale. */
+  at?: number;
 }
 
 /** Connect times per region, one entry per try; `undefined` for a try that failed or timed out. */
@@ -28,33 +30,42 @@ export function pickRegion(timings: Timings): AutoPick {
   return best;
 }
 
-/** Milliseconds to open a TCP+TLS connection to `host`, which is then dropped: no request, no key. */
-function timeConnect(host: string): Promise<number | undefined> {
+/**
+ * Milliseconds to open a TCP+TLS connection to `host`, which is then dropped: no request, no key.
+ * Aborting `signal` destroys the socket (and with it its timeout) and resolves `undefined`.
+ */
+export function timeConnect(host: string, signal?: AbortSignal, port = 443): Promise<number | undefined> {
   return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve(undefined);
+      return;
+    }
     const started = performance.now();
-    const socket = connect({ host, port: 443, servername: host, timeout: TIMEOUT_MS });
+    const socket = connect({ host, port, servername: host, timeout: TIMEOUT_MS });
+    const abort = () => done(undefined);
     const done = (ms: number | undefined) => {
+      signal?.removeEventListener("abort", abort);
       socket.destroy();
       resolve(ms);
     };
     socket.once("secureConnect", () => done(performance.now() - started));
     socket.once("timeout", () => done(undefined));
     socket.once("error", () => done(undefined));
-    // Never keeps pi alive on exit.
-    socket.unref();
+    // A connection that is still opening keeps the process alive (unref does not help), so shutdown aborts it.
+    signal?.addEventListener("abort", abort, { once: true });
   });
 }
 
-export type MeasureRegions = () => Promise<Timings>;
+export type MeasureRegions = (signal?: AbortSignal) => Promise<Timings>;
 
-/** Times every host, all at once, a few tries each one after the other. Never rejects. */
-export const measureRegions: MeasureRegions = async () => {
+/** Times every host, all at once, a few tries each one after the other. Never rejects. Aborting ends it early. */
+export const measureRegions: MeasureRegions = async (signal) => {
   const timings: Timings = {};
   await Promise.all(
     (Object.keys(REGION_HOSTS) as Region[]).map(async (region) => {
       const tries: Array<number | undefined> = [];
       for (let i = 0; i < TRIES; i += 1) {
-        const ms = await timeConnect(REGION_HOSTS[region]);
+        const ms = await timeConnect(REGION_HOSTS[region], signal);
         tries.push(ms);
         if (ms === undefined) break;
       }
