@@ -1,6 +1,6 @@
 {
   "name": "pi-streaming-voice",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Push-to-talk streaming voice input for pi, using Deepgram Nova-3",
   "type": "module",
   "license": "MIT",

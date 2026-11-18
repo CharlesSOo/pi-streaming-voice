@@ -81,3 +81,33 @@ test("checkHotkey rejects keys pi binds and names the action", () => {
     assert.deepEqual(checkHotkey(id, BINDINGS), { ok: false, reason: `${splitKeyId(id).mods.concat(splitKeyId(id).base).join("+")} is already used by pi for ${action}` }, id);
   }
 });
+
+test("classifyHotkey: lock bits on a combo press are ignored; extra real modifiers are not", () => {
+  const altV = splitKeyId("alt+v");
+  assert.equal(classifyHotkey("\x1b[118;67u", altV), "press"); // alt + caps_lock
+  assert.equal(classifyHotkey("\x1b[118;131u", altV), "press"); // alt + num_lock
+  assert.equal(classifyHotkey("\x1b[118;4u", altV), undefined); // shift+alt+v
+  assert.equal(classifyHotkey("\x1b[118;7u", altV), undefined); // ctrl+alt+v
+  assert.equal(classifyHotkey("\x1b[118;4:3u", altV), "release"); // released with shift down
+  assert.equal(classifyHotkey("\x1b[118;1:3u", altV), "release"); // alt came up first
+  assert.equal(classifyHotkey("\x1bv", altV), "press"); // legacy alt+v
+});
+
+test("classifyHotkey: Space with other modifiers", () => {
+  const space = splitKeyId("space");
+  assert.equal(classifyHotkey("\x1b[32;2u", space), undefined); // shift+space encoded is not the hotkey press
+  assert.equal(classifyHotkey("\x1b[32;5:3u", space), "release"); // any Space release counts
+});
+
+test("checkHotkey against pi's real default bindings", async () => {
+  const { KEYBINDINGS } = await import("../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js");
+  const { KeybindingsManager } = await import("@earendil-works/pi-tui");
+  const bindings = new KeybindingsManager({ ...TUI_KEYBINDINGS, ...KEYBINDINGS }).getResolvedBindings();
+  for (const key of ["ctrl+c", "ctrl+d", "ctrl+z", "escape", "enter", "tab", "backspace", "a", "shift+a", "1", "/", "f5", "up", "shift+enter", "shift+tab", "alt+enter", "ctrl+k", "ctrl+l"]) {
+    assert.equal(checkHotkey(key, bindings).ok, false, `${key} should be refused`);
+  }
+  for (const key of ["space", "alt+v", "ctrl+space", "super+k", "super+j", "alt+shift+v"]) {
+    assert.equal(checkHotkey(key, bindings).ok, true, `${key} should be allowed`);
+  }
+  assert.equal(checkHotkey(undefined, bindings).ok, false);
+});

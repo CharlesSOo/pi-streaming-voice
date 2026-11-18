@@ -6,7 +6,7 @@ Speech is streamed to Deepgram Nova-3 and the text lands at your cursor as you s
 - A quick tap of Space still types a space.
 - `/voice-settings` changes the hotkey (Space or a combo such as `alt+v`), hold or tap mode, and the Deepgram region.
 - Words are typed into the editor at the cursor as you speak and corrected in place as Deepgram refines them
-  (like Claude Code's `/voice`). A small recording dot, level meter and `listening…` show at the right, above the editor.
+  (like Claude Code's `/voice`). A small level meter and `listening…` show at the right end of the editor's top border.
 - Only active when the main editor has focus; in dialogs, selectors and overlays the hotkey behaves normally.
 - Registers `/voice`, so it replaces Pi Voice (`pi-transcribe`): uninstall that package first, or both commands get renamed to `/voice:1`/`/voice:2`.
 
@@ -87,13 +87,16 @@ Terminals without the kitty keyboard protocol cannot report cmd at all.
 ### Mode
 
 - **hold** (default): talk while the key is down. Space works as described under "How the hold is detected". A combo
-  starts recording the moment it is pressed and stops on release.
+  starts recording the moment it is pressed and stops on release. Hold mode needs the OS key repeat to be on; with
+  it off, use tap mode with a combo.
 - **tap**: one press starts recording; a second press, or Escape, stops it. You can keep typing while it records.
   Tap needs a combo hotkey, because a tapped Space has to stay a space: choosing tap while the hotkey is Space asks
   for a new hotkey first, and stays on hold if you cancel. A take also ends when a dialog takes the focus.
 
 In a terminal without key-release events (no kitty keyboard protocol), a combo cannot be held, so it works as tap
-even in hold mode; pi says so once. Space hold works there as usual.
+even in hold mode; pi says so once. There, a held key arrives as a stream of presses, so a press counts as a second
+press only when no other follows it within 125 ms; stopping therefore takes effect 125 ms after the press. Space
+hold works there as usual.
 
 ### Region
 
@@ -124,20 +127,32 @@ region explicitly; a fixed region is never measured and never changes.
 
 ## How the hold is detected
 
-This is about Space, the only hotkey that also types.
+Hold mode is driven by the OS auto-repeat of the held key: the repeats are what shows the key is still down. **The
+OS key repeat has to be on** (macOS: System Settings → Keyboard → Key repeat rate, not "Off"). With it off, a held
+Space just types one space and a held combo records for 2 s; use tap mode with a combo instead.
 
-- **Kitty keyboard protocol terminals** (press/repeat/release events): Space is a hold once it has been down for
-  350 ms without a release. The space the press typed is removed, recording starts, and the release event stops it.
-  Typing another key before the 350 ms are up makes it an ordinary space. The release counts whatever modifiers are
-  down by then (Shift for the next capital, Caps Lock). This path is used once pi has negotiated the protocol *and*
-  a key-release event has actually been seen.
+Space is the only hotkey that also types:
+
+- **Kitty keyboard protocol terminals** (key-release events): the press types a space. Its first auto-repeat makes
+  it a hold: the space is removed and recording starts, so recording starts after your OS "delay until repeat". The
+  release event stops it. A tap, or typing another key while Space is down, leaves an ordinary space. Text that
+  merely contains spaces (a paste, text injected by another tool) never records: a second space sooner than 120 ms
+  after the first is text, not a repeat. The release counts whatever modifiers are down by then (Shift for the next
+  capital, Caps Lock). This path is used once pi has negotiated the protocol *and* a key-release event has actually
+  been seen.
 - **Other terminals** (only auto-repeat): three consecutive spaces at most 125 ms apart (auto-repeat) mean a hold;
   the spaces typed while detecting — including the original press, if it came at most 650 ms before the first
-  repeat — are removed. Recording stops when no repeat arrives for max(200 ms, 2.5 × the repeat interval), or when
-  another key is pressed. Hold detection therefore starts after your OS key-repeat delay.
+  repeat — are removed. Recording stops when the repeats stop (below), or when another key is pressed.
 
-On both paths, and for combos, a hold that has seen auto-repeats also ends when the repeats stop for that same gap,
-so a release that never arrives (focus moved away mid-hold) cannot leave the microphone open.
+A combo starts recording on the press and stops on the release.
+
+On every path a hold also ends when its repeats stop for max(500 ms, 2.5 × the repeat interval), and a combo hold
+ends if no repeat or release follows the press within 2 s. So a release that never arrives (focus moved away
+mid-hold) cannot leave the microphone open. If it was only a stall and the key is still down, the next repeat
+starts a new take at once, so at most the words spoken during the stall are lost.
+
+`listening…` appears once the microphone is delivering audio (`starting…` until then, typically 150 ms): start
+talking when you see it.
 
 ## While a take is running
 

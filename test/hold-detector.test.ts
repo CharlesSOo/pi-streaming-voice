@@ -123,8 +123,8 @@ test("repeat path: release gap scales with slow repeat rate", () => {
   const h = new Harness();
   holdLegacy(h, 3, 400, 110);
   assert.deepEqual(h.log, ["delete:3", "start"]);
-  h.send(PRESS, 110);
-  h.advance(260); // 2.5 × 110 = 275
+  h.send(PRESS, 240);
+  h.advance(590); // 2.5 × 240 = 600
   assert.deepEqual(h.log, ["delete:3", "start"]);
   h.advance(20);
   assert.deepEqual(h.log, ["delete:3", "start", "stop"]);
@@ -170,15 +170,22 @@ function kittyHarness(): Harness {
   return h;
 }
 
+/** Kitty-path Space hold as Rex sends it: a plain press, then the first plain repeat after the OS initial delay. */
+function holdKitty(h: Harness, initialDelay = 400): void {
+  h.send(PRESS);
+  h.send(PRESS, initialDelay);
+}
+
 test("kitty path: not used until a release event is seen", () => {
   const h = new Harness();
   h.kitty = true;
   h.send(PRESS);
-  h.advance(1000); // no threshold timer on the repeat path
+  assert.equal(h.send(PRESS, 400), undefined); // repeat path: one repeat is not a hold yet
+  h.advance(1000);
   assert.deepEqual(h.log, []);
   h.send(OTHER_RELEASE);
   h.send(PRESS, 1000);
-  h.advance(DEFAULT_THRESHOLDS.kittyHoldMs);
+  assert.deepEqual(h.send(PRESS, 400), { consume: true });
   assert.deepEqual(h.log, ["delete:1", "start"]);
 });
 
@@ -190,31 +197,55 @@ test("kitty path: a tap types a space", () => {
   assert.deepEqual(h.log, []);
 });
 
-test("kitty path: hold starts after threshold, deletes the typed space, release stops", () => {
+test("kitty path: hold starts on the first repeat, deletes the typed space, release stops", () => {
   const h = kittyHarness();
   assert.equal(h.send(PRESS), undefined);
-  h.advance(DEFAULT_THRESHOLDS.kittyHoldMs - 1);
+  h.advance(399);
   assert.deepEqual(h.log, []);
-  h.advance(1);
+  assert.deepEqual(h.send(K_REPEAT, 1), { consume: true });
   assert.deepEqual(h.log, ["delete:1", "start"]);
-  h.advance(5000); // holding silently (key repeat off) keeps recording
-  assert.deepEqual(h.log, ["delete:1", "start"]);
-  assert.deepEqual(h.send(K_REPEAT, 100), { consume: true });
   assert.deepEqual(h.send(K_REPEAT, 30), { consume: true });
   assert.deepEqual(h.send(K_RELEASE, 30), { consume: true });
   assert.deepEqual(h.log, ["delete:1", "start", "stop"]);
 });
 
-test("kitty path: repeats before the threshold are swallowed", () => {
+test("kitty path: a Space held with the OS key repeat off never records", () => {
+  const h = kittyHarness();
+  assert.equal(h.send(PRESS), undefined);
+  h.advance(5000);
+  assert.equal(h.send(K_RELEASE), undefined);
+  assert.deepEqual(h.log, []);
+});
+
+test("kitty path: text ending in a space, with no release, never records", () => {
+  const h = kittyHarness();
+  for (const ch of "word ") assert.equal(h.send(ch), undefined);
+  h.advance(60_000);
+  assert.deepEqual(h.log, []);
+  assert.equal(h.detector.phase, "idle");
+});
+
+test("kitty path: two spaces a few ms apart with no release are text", () => {
+  const h = kittyHarness();
+  assert.equal(h.send(PRESS), undefined);
+  assert.equal(h.send(PRESS, 5), undefined);
+  h.advance(60_000);
+  assert.deepEqual(h.log, []);
+  // A space long after is a new press, not a repeat of that one.
+  assert.equal(h.send(PRESS), undefined);
+  assert.deepEqual(h.log, []);
+});
+
+test("kitty path: an encoded repeat right after the press is a hold", () => {
   const h = kittyHarness();
   h.send(PRESS);
-  assert.deepEqual(h.send(K_REPEAT, 300), { consume: true });
+  assert.deepEqual(h.send(K_REPEAT, 20), { consume: true });
+  assert.deepEqual(h.log, ["delete:1", "start"]);
 });
 
 test("kitty path: plain-text repeats (Rex, kitty without flag 8) keep recording", () => {
   const h = kittyHarness();
-  h.send(PRESS);
-  h.advance(400);
+  holdKitty(h);
   for (let i = 0; i < 20; i += 1) assert.deepEqual(h.send(PRESS, 30), { consume: true });
   assert.deepEqual(h.log, ["delete:1", "start"]);
   assert.deepEqual(h.send(K_RELEASE, 30), { consume: true });
@@ -223,16 +254,14 @@ test("kitty path: plain-text repeats (Rex, kitty without flag 8) keep recording"
 
 test("kitty path: an encoded press while recording means a missed release", () => {
   const h = kittyHarness();
-  h.send(PRESS);
-  h.advance(400);
+  holdKitty(h);
   assert.deepEqual(h.send("\x1b[32u", 100), { consume: true });
   assert.deepEqual(h.log, ["delete:1", "start", "stop"]);
 });
 
 test("kitty path: cancel drains until release", () => {
   const h = kittyHarness();
-  h.send(PRESS);
-  h.advance(400);
+  holdKitty(h);
   h.detector.cancel();
   assert.deepEqual(h.send(K_REPEAT, 50), { consume: true });
   assert.deepEqual(h.send(K_RELEASE, 50), { consume: true });
@@ -273,26 +302,24 @@ test("kitty path: a release with Shift or Caps Lock down still ends a tap", () =
 
 test("kitty path: releasing a hold with Shift down stops recording", () => {
   const h = kittyHarness();
-  h.send(PRESS);
-  h.advance(400);
-  assert.deepEqual(h.send(K_RELEASE_SHIFT, 1000), { consume: true });
+  holdKitty(h);
+  assert.deepEqual(h.send(K_RELEASE_SHIFT, 100), { consume: true });
   assert.deepEqual(h.log, ["delete:1", "start", "stop"]);
 });
 
-test("kitty path: typing on before the threshold cancels the pending hold", () => {
+test("kitty path: typing on with Space still down is a typed space, not a hold", () => {
   const h = kittyHarness();
   assert.equal(h.send(PRESS), undefined);
   assert.equal(h.send("x", 60), undefined);
   assert.equal(h.send("y", 60), undefined);
-  h.advance(400); // Space still down
+  assert.equal(h.send(PRESS, 400), undefined); // a space after other keys is a new press
   assert.deepEqual(h.log, []);
   assert.equal(h.detector.phase, "idle");
 });
 
 test("kitty path: a lost release ends the hold once the repeats stop", () => {
   const h = kittyHarness();
-  h.send(PRESS);
-  h.advance(400);
+  holdKitty(h);
   for (let i = 0; i < 20; i += 1) h.send(PRESS, 30); // then the release goes elsewhere
   h.advance(DEFAULT_THRESHOLDS.releaseGapMinMs - 10);
   assert.deepEqual(h.log, ["delete:1", "start"]);
@@ -303,8 +330,7 @@ test("kitty path: a lost release ends the hold once the repeats stop", () => {
 
 test("kitty path: a cancelled hold whose release is lost stops swallowing Space", () => {
   const h = kittyHarness();
-  h.send(PRESS);
-  h.advance(400);
+  holdKitty(h);
   for (let i = 0; i < 5; i += 1) h.send(PRESS, 30);
   h.detector.cancel();
   h.advance(1000);
@@ -347,19 +373,27 @@ test("combo hold: release counts when alt came up first", () => {
   assert.deepEqual(h.log, ["start", "stop"]);
 });
 
-test("combo hold: a lost release ends the hold once the repeats stop; without repeats a new press does", () => {
+test("combo hold: a lost release ends the hold once the repeats stop, or after 2 s without any", () => {
   const h = comboHarness();
   h.send(ALT_V);
   h.send(ALT_V_REPEAT, 400);
   for (let i = 0; i < 10; i += 1) h.send(ALT_V_REPEAT, 30);
-  h.advance(10 * 60_000);
+  h.advance(DEFAULT_THRESHOLDS.releaseGapMinMs + 1);
   assert.deepEqual(h.log, ["start", "stop"]);
 
+  h.advance(60_000);
   h.send(ALT_V);
-  h.advance(60_000); // no repeats seen: nothing to go by
+  h.advance(DEFAULT_THRESHOLDS.noRepeatMs - 1);
   assert.deepEqual(h.log, ["start", "stop", "start"]);
-  assert.deepEqual(h.send(ALT_V), { consume: true });
+  h.advance(2);
   assert.deepEqual(h.log, ["start", "stop", "start", "stop"]);
+});
+
+test("combo hold: a new press while recording means a missed release", () => {
+  const h = comboHarness();
+  h.send(ALT_V);
+  assert.deepEqual(h.send(ALT_V, 1000), { consume: true });
+  assert.deepEqual(h.log, ["start", "stop"]);
 });
 
 test("combo hold: cancel drains until release", () => {
@@ -409,7 +443,8 @@ test("tap: cancel returns to idle", () => {
   h.send(ALT_V);
   h.detector.cancel();
   assert.equal(h.detector.phase, "idle");
-  h.send(ALT_V, 1000);
+  h.send(ALT_V, 1000); // no release seen since the last press: a press once nothing follows it
+  h.advance(DEFAULT_THRESHOLDS.repeatGapMs);
   assert.deepEqual(h.log, ["start", "start"]);
 });
 
@@ -422,7 +457,10 @@ test("no release events: a hold-mode combo works as tap, and a held key is one p
   for (let i = 0; i < 30; i += 1) assert.deepEqual(h.send(LEGACY_ALT_V, 35), { consume: true });
   h.advance(5000);
   assert.deepEqual(h.log, ["start"]);
+  // A lone press stops, once the repeat gap has passed with nothing following.
   assert.deepEqual(h.send(LEGACY_ALT_V), { consume: true });
+  assert.deepEqual(h.log, ["start"]);
+  h.advance(DEFAULT_THRESHOLDS.repeatGapMs);
   assert.deepEqual(h.log, ["start", "stop"]);
 });
 
@@ -441,4 +479,166 @@ test("configure forgets a hold in progress and switches key", () => {
   assert.equal(h.send(ALT_V), undefined);
   assert.deepEqual(h.send("\x1b[107;9u"), { consume: true });
   assert.deepEqual(h.log, ["start", "start"]);
+});
+
+// ---- lost releases, stalls and the tap fallback (0.2.2) ----
+
+const starts = (h: Harness) => h.log.filter((l) => l === "start").length;
+const stops = (h: Harness) => h.log.filter((l) => l === "stop").length;
+
+test("kitty path: a release lost right after the first repeat still ends the hold", () => {
+  const h = kittyHarness();
+  holdKitty(h, 500);
+  assert.equal(h.detector.phase, "recording");
+  h.advance(60_000);
+  assert.equal(stops(h), 1);
+});
+
+test("combo hold: a release lost before any repeat ends the hold", () => {
+  const h = comboHarness();
+  h.send(ALT_V);
+  h.advance(60_000);
+  assert.equal(stops(h), 1);
+});
+
+test("watchdog: steady 33 ms plain-text repeats for 10 s never stop the hold", () => {
+  const h = kittyHarness();
+  holdKitty(h, 500);
+  for (let t = 0; t < 10_000; t += 33) h.send(PRESS, 33);
+  assert.equal(stops(h), 0);
+  h.send(K_RELEASE, 10);
+  assert.equal(stops(h), 1);
+});
+
+test("watchdog: slow auto-repeat (450 ms) is never mistaken for a release", () => {
+  const h = kittyHarness();
+  h.send(PRESS);
+  for (let i = 0; i < 10; i += 1) h.send(PRESS, 450);
+  assert.equal(stops(h), 0);
+  h.send(K_RELEASE, 100);
+  assert.equal(stops(h), 1);
+});
+
+test("watchdog: a 400 ms hiccup in fast repeats does not end the hold", () => {
+  const h = kittyHarness();
+  holdKitty(h, 500);
+  for (let i = 0; i < 10; i += 1) h.send(PRESS, 90);
+  h.send(PRESS, 400);
+  assert.equal(stops(h), 0);
+});
+
+/** A hold whose repeats stall for 700 ms with the key still down: cut by the watchdog, resumed by the next repeat. */
+function stalledHold(h: Harness, press: string, repeat: string): void {
+  h.send(press);
+  h.send(repeat, 500);
+  for (let i = 0; i < 30; i += 1) h.send(repeat, 33);
+  h.advance(699);
+  assert.equal(stops(h), 1);
+  assert.equal(starts(h), 1);
+  assert.deepEqual(h.send(repeat, 1), { consume: true });
+  assert.equal(starts(h), 2, "the first repeat after the stall resumes at once");
+  for (let i = 0; i < 90; i += 1) assert.deepEqual(h.send(repeat, 33), { consume: true });
+  assert.equal(stops(h), 1);
+}
+
+test("stall: plain-text repeats resume as a new take, leaving no spaces", () => {
+  const h = kittyHarness();
+  stalledHold(h, PRESS, PRESS);
+  h.send(K_RELEASE, 10);
+  assert.deepEqual(h.log, ["delete:1", "start", "stop", "start", "stop"]);
+});
+
+test("stall: kitty-encoded repeats resume as a new take", () => {
+  const h = kittyHarness();
+  stalledHold(h, PRESS, K_REPEAT);
+  h.send(K_RELEASE, 10);
+  assert.deepEqual(h.log, ["delete:1", "start", "stop", "start", "stop"]);
+});
+
+test("stall: combo repeats resume as a new take", () => {
+  const h = comboHarness();
+  stalledHold(h, ALT_V, ALT_V_REPEAT);
+  h.send(ALT_V_RELEASE, 10);
+  assert.deepEqual(h.log, ["start", "stop", "start", "stop"]);
+});
+
+test("stall: a release after the cut means the key is up; later a Space types", () => {
+  const h = kittyHarness();
+  holdKitty(h);
+  h.advance(600);
+  assert.deepEqual(h.log, ["delete:1", "start", "stop"]);
+  h.send(K_RELEASE, 100);
+  assert.equal(h.send(PRESS, 100), undefined);
+  assert.deepEqual(h.log, ["delete:1", "start", "stop"]);
+});
+
+test("stall: long after a cut, a Space is a new press", () => {
+  const h = kittyHarness();
+  holdKitty(h);
+  h.advance(600 + DEFAULT_THRESHOLDS.noRepeatMs);
+  assert.equal(h.send(PRESS), undefined);
+  assert.deepEqual(h.log, ["delete:1", "start", "stop"]);
+});
+
+test("repeat path: a hold cut by a stall starts again and removes the spaces typed meanwhile", () => {
+  const h = new Harness();
+  holdLegacy(h, 3);
+  for (let i = 0; i < 10; i += 1) h.send(PRESS, 33);
+  h.send(PRESS, 700);
+  h.send(PRESS, 33);
+  assert.deepEqual(h.send(PRESS, 33), { consume: true });
+  assert.deepEqual(h.log, ["delete:3", "start", "stop", "delete:2", "start"]);
+});
+
+test("tap: a held combo (repeats) does not toggle the take off; release then press does", () => {
+  const h = comboHarness("tap");
+  h.send(ALT_V);
+  for (let i = 0; i < 20; i += 1) h.send(ALT_V_REPEAT, 33);
+  assert.equal(stops(h), 0);
+  h.send(ALT_V_RELEASE, 10);
+  h.advance(5000);
+  assert.equal(stops(h), 0, "tap mode has no watchdog");
+  h.send(ALT_V, 10);
+  assert.equal(stops(h), 1);
+});
+
+const ALT_V_LEGACY = "\x1bv";
+
+test("tap fallback: a second press 500 ms after the first stops the take", () => {
+  const h = comboHarness("hold", false);
+  h.send(ALT_V_LEGACY);
+  h.send(ALT_V_LEGACY, 500);
+  h.advance(DEFAULT_THRESHOLDS.repeatGapMs);
+  assert.deepEqual(h.log, ["start", "stop"]);
+});
+
+test("tap fallback: auto-repeat after a long OS initial delay is not a second press", () => {
+  const h = comboHarness("hold", false);
+  h.send(ALT_V_LEGACY);
+  h.send(ALT_V_LEGACY, 900);
+  for (let i = 0; i < 10; i += 1) h.send(ALT_V_LEGACY, 50);
+  h.advance(5000);
+  assert.deepEqual(h.log, ["start"]);
+  h.send(ALT_V_LEGACY);
+  h.advance(DEFAULT_THRESHOLDS.repeatGapMs);
+  assert.deepEqual(h.log, ["start", "stop"]);
+});
+
+test("tap fallback: holding the press that stops does not start another take", () => {
+  const h = comboHarness("hold", false);
+  h.send(ALT_V_LEGACY);
+  h.send(ALT_V_LEGACY, 3000);
+  h.send(ALT_V_LEGACY, 400); // its auto-repeat
+  for (let i = 0; i < 10; i += 1) h.send(ALT_V_LEGACY, 50);
+  h.advance(5000);
+  assert.deepEqual(h.log, ["start", "stop"]);
+});
+
+test("tap fallback: a press soon after a stop starts once it is known to be alone", () => {
+  const h = comboHarness("hold", false);
+  h.send(ALT_V_LEGACY);
+  h.send(ALT_V_LEGACY, 3000);
+  h.send(ALT_V_LEGACY, 1000);
+  h.advance(DEFAULT_THRESHOLDS.repeatGapMs);
+  assert.deepEqual(h.log, ["start", "stop", "start"]);
 });

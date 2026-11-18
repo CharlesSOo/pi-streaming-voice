@@ -1,6 +1,7 @@
 // The extension end to end, minus network and microphone (see harness.ts).
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { activeTimers, ALT_V, ALT_V_RELEASE, FakeSocket, makeRig, mic, sleep, TEST_KEY, type Rig } from "./harness.ts";
 
 const tick = () => sleep(5);
@@ -47,7 +48,7 @@ test("tap types one space, no take", async () => {
   await sleep(400);
   assert.equal(rig.text(), " ");
   assert.equal(FakeSocket.instances.length, 0);
-  assert.deepEqual(rig.widgetLines(), []);
+  assert.equal(rig.indicator(), "");
 });
 
 test("hold: space removed, live interims revised in place, final stays, never submits", async () => {
@@ -59,13 +60,16 @@ test("hold: space removed, live interims revised in place, final stays, never su
   rig.editor.setText("fix");
   await startTake(rig);
   assert.equal(rig.text(), "fix", "space typed by the press is removed");
-  assert.match(rig.widgetLines()[0] ?? "", /listening…$/);
+  assert.match(rig.indicator(), /listening…$/);
+  const drawn = rig.editor.render(60);
+  assert.match(drawn[0] ?? "", /^─+ [▁-█]{4} listening… ─\x1b\[0m$/, "meter and label on the top border, no dot");
+  assert.equal(visibleWidth(drawn[0] ?? ""), 60, "the border keeps its width");
   const s = rig.socket();
   assert.match(s.url, /^wss:\/\/api\.deepgram\.com\/v1\/listen\?/);
   assert.ok(!s.url.includes(TEST_KEY), "key must not be in the URL");
   assert.deepEqual(s.init, { headers: { Authorization: `Token ${TEST_KEY}` } });
   rig.recorder().opts.onChunk({ samples: new Float32Array(800).fill(0.1) });
-  assert.equal(s.sent.length, 1);
+  assert.equal(s.sent.length, 2, "the chunk the device delivered on start, and this one");
   s.interim("the bug in");
   assert.equal(rig.text(), "fix the bug in");
   s.interim("the bug in pie");
@@ -76,16 +80,41 @@ test("hold: space removed, live interims revised in place, final stays, never su
   assert.equal(rig.text(), "fix The bug in Pi. and add");
   rig.release();
   await tick();
-  assert.match(rig.widgetLines()[0] ?? "", /transcribing…$/);
+  assert.match(rig.indicator(), /transcribing…$/);
   assert.ok(s.json.some((j) => j.includes("Finalize")));
   s.final("And add tests.", { from_finalize: true });
   await sleep(20);
   assert.equal(rig.text(), "fix The bug in Pi. And add tests.");
-  assert.deepEqual(rig.widgetLines(), []);
+  assert.equal(rig.indicator(), "");
   assert.ok(rig.recorder().stopped && rig.recorder().closed, "mic released");
   assert.equal(submitted, 0);
   assert.ok(rig.notifications.every((n) => !n.message.includes(TEST_KEY)));
   rig.shutdown();
+});
+
+test("`listening…` shows only once the microphone delivers audio; a release before that still ends the take", async () => {
+  const rig = makeRig();
+  mic.silent = true; // open, but nothing delivered yet
+  await rig.hold();
+  await tick();
+  assert.match(rig.indicator(), /starting…$/);
+  rig.recorder().opts.onChunk({ samples: new Float32Array(800) });
+  assert.match(rig.indicator(), /listening…$/);
+  rig.shutdown();
+
+  const silent = makeRig();
+  mic.silent = true;
+  await silent.hold();
+  await tick();
+  silent.socket().open();
+  silent.release();
+  await tick();
+  assert.match(silent.indicator(), /transcribing…$/);
+  silent.socket().final("", { from_finalize: true });
+  await sleep(20);
+  assert.equal(silent.indicator(), "");
+  assert.ok(silent.recorder().stopped && silent.recorder().closed);
+  silent.shutdown();
 });
 
 test("overlay up: Space passes through and nothing starts", async () => {
@@ -109,7 +138,7 @@ test("a Space released with Shift down, then a capital: nothing deleted, nothing
   assert.equal(FakeSocket.instances.length, 0);
 });
 
-test("typing on with Space still down past the threshold: `ab xy`, no recording", async () => {
+test("typing on with Space still down: `ab xy`, no recording", async () => {
   const rig = makeRig();
   rig.feed("\x1b[97;1:3u");
   for (const ch of ["a", "b", " ", "x", "y"]) rig.feed(ch);
@@ -172,12 +201,13 @@ test("a Space typed while `transcribing…` that turns into a hold is not left b
   first.interim("one");
   rig.release(); // transcribing…
   rig.feed(" "); // held back with the other keys
-  await sleep(380); // … and it was a hold
+  await sleep(150);
+  rig.feed(" "); // … and its first repeat made it a hold
   first.final("One.", { from_finalize: true });
   await sleep(30);
   assert.equal(rig.text(), "One.");
   assert.equal(FakeSocket.instances.length, 2, "the second hold started once the first take settled");
-  assert.match(rig.widgetLines()[0] ?? "", /listening/);
+  assert.match(rig.indicator(), /listening/);
   rig.socket().open();
   rig.socket().final("Two.");
   await finishNormally(rig);
@@ -189,12 +219,13 @@ test("a second hold released before the first take settled starts nothing", asyn
   const rig = await startTake();
   rig.release();
   rig.feed(" ");
-  await sleep(380);
+  await sleep(150);
+  rig.feed(" ");
   rig.release();
   rig.socket().final("", { from_finalize: true });
   await sleep(30);
   assert.equal(FakeSocket.instances.length, 1);
-  assert.deepEqual(rig.widgetLines(), []);
+  assert.equal(rig.indicator(), "");
   rig.shutdown();
 });
 
@@ -205,7 +236,7 @@ test("a take settles on the finalized result, not on the server closing the sock
   await tick();
   rig.socket().final("Done.", { from_finalize: true });
   await sleep(20);
-  assert.deepEqual(rig.widgetLines(), []);
+  assert.equal(rig.indicator(), "");
   assert.equal(rig.text(), "Done.");
   rig.shutdown();
 });
@@ -221,7 +252,7 @@ test("network drop mid-take: one error, interim text kept, mic released, next ho
   await sleep(20);
   assert.deepEqual(rig.notifications, [{ message: "Lost connection to Deepgram (kept the text transcribed so far)", type: "error" }]);
   assert.equal(rig.text(), "First sentence. second sen");
-  assert.deepEqual(rig.widgetLines(), []);
+  assert.equal(rig.indicator(), "");
   assert.ok(rig.recorder().stopped && rig.recorder().closed);
   assert.equal(rig.feed(" "), "consumed"); // the rest of the hold is swallowed
   rig.release();
@@ -238,7 +269,7 @@ test("a connection that never opens points at the key", async () => {
   rig.socket().serverClose(1006, "");
   await sleep(20);
   assert.deepEqual(rig.notifications.map((n) => n.message), ["Could not connect to Deepgram: check DEEPGRAM_API_KEY and your network"]);
-  assert.deepEqual(rig.widgetLines(), []);
+  assert.equal(rig.indicator(), "");
   assert.ok(rig.recorder().stopped);
   rig.shutdown();
 });
@@ -249,7 +280,7 @@ test("mic permission denied: clear message, no stuck state", async () => {
   await rig.hold();
   await sleep(20);
   assert.match(rig.notifications[0]?.message ?? "", /Microphone access denied/);
-  assert.deepEqual(rig.widgetLines(), []);
+  assert.equal(rig.indicator(), "");
   rig.shutdown();
 });
 
@@ -259,7 +290,7 @@ test("finalize timeout: the take ends after 3 s and says the last words may be m
   rig.socket().interim("words still interim");
   rig.release();
   const t0 = Date.now();
-  while (rig.widgetLines().length && Date.now() - t0 < 6000) await sleep(50);
+  while (rig.indicator() && Date.now() - t0 < 6000) await sleep(50);
   const took = Date.now() - t0;
   assert.ok(took > 2800 && took < 3600, `transcribing… lasted ${took} ms`);
   assert.equal(rig.text(), "words still interim");
@@ -302,7 +333,7 @@ test("/voice off while the mic is still opening releases the mic", async () => {
   await sleep(30);
   const r = rig.recorder();
   assert.ok(r.stopped && r.closed, "microphone left open");
-  assert.deepEqual(rig.widgetLines(), []);
+  assert.equal(rig.indicator(), "");
   rig.shutdown();
 });
 
@@ -460,7 +491,7 @@ test("alt+v hold: records while down, types nothing, Space is an ordinary key ag
   await useAltV(rig);
   assert.equal(rig.feed(ALT_V), "consumed");
   await tick();
-  assert.match(rig.widgetLines()[0] ?? "", /listening…$/);
+  assert.match(rig.indicator(), /listening…$/);
   const s = rig.socket();
   s.open();
   s.interim("hello");
@@ -469,7 +500,7 @@ test("alt+v hold: records while down, types nothing, Space is an ordinary key ag
   s.final("Hello.", { from_finalize: true });
   await sleep(20);
   assert.equal(rig.text(), "Hello.");
-  assert.deepEqual(rig.widgetLines(), []);
+  assert.equal(rig.indicator(), "");
   for (let i = 0; i < 6; i += 1) rig.feed(" ");
   await sleep(400);
   assert.equal(rig.text(), "Hello.      ");
@@ -483,7 +514,7 @@ test("alt+v tap: press starts, typing goes on, a second press stops", async () =
   rig.feed(ALT_V);
   rig.feed(ALT_V_RELEASE);
   await tick();
-  assert.match(rig.widgetLines()[0] ?? "", /listening…$/);
+  assert.match(rig.indicator(), /listening…$/);
   const s = rig.socket();
   s.open();
   s.interim("hello wor");
@@ -493,10 +524,10 @@ test("alt+v tap: press starts, typing goes on, a second press stops", async () =
   assert.equal(rig.text(), "x Hello world.");
   rig.feed(ALT_V);
   await tick();
-  assert.match(rig.widgetLines()[0] ?? "", /transcribing…$/);
+  assert.match(rig.indicator(), /transcribing…$/);
   s.final("", { from_finalize: true });
   await sleep(20);
-  assert.deepEqual(rig.widgetLines(), []);
+  assert.equal(rig.indicator(), "");
   assert.ok(rig.recorder().stopped);
   rig.shutdown();
 });
@@ -509,7 +540,7 @@ test("alt+v tap: Escape stops the take and goes no further", async () => {
   rig.socket().open();
   assert.equal(rig.feed("\x1b[27u"), "consumed");
   await tick();
-  assert.match(rig.widgetLines()[0] ?? "", /transcribing…$/);
+  assert.match(rig.indicator(), /transcribing…$/);
   rig.shutdown();
 });
 
@@ -522,7 +553,7 @@ test("alt+v tap: a dialog taking the focus ends the take", async () => {
   rig.overlay = true;
   assert.equal(rig.feed("j"), "passed");
   await tick();
-  assert.match(rig.widgetLines()[0] ?? "", /transcribing…$/);
+  assert.match(rig.indicator(), /transcribing…$/);
   rig.shutdown();
 });
 
@@ -533,7 +564,7 @@ test("no release events: an alt+v hold works as tap, with one notice", async () 
   setKittyProtocolActive(false);
   rig.feed("\x1bv");
   await tick();
-  assert.match(rig.widgetLines()[0] ?? "", /listening…$/);
+  assert.match(rig.indicator(), /listening…$/);
   assert.deepEqual(rig.notifications.map((n) => n.message), [
     "This terminal does not report key releases, so alt+v works as tap: press it again or Escape to stop.",
   ]);

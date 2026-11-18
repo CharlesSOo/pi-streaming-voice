@@ -3,7 +3,7 @@ import {
   isKeyRelease,
   isKittyProtocolActive,
   parseKey,
-  truncateToWidth,
+  sliceByColumn,
   visibleWidth,
   type Component,
   type TUI,
@@ -28,6 +28,7 @@ interface EditorLike {
   insertTextAtCursor(text: string): void;
   getLines(): string[];
   getCursor(): { line: number; col: number };
+  render(width: number): string[];
 }
 
 function asEditor(component: unknown): EditorLike | undefined {
@@ -37,7 +38,8 @@ function asEditor(component: unknown): EditorLike | undefined {
     typeof c.insertTextAtCursor === "function" &&
     typeof c.handleInput === "function" &&
     typeof c.getLines === "function" &&
-    typeof c.getCursor === "function"
+    typeof c.getCursor === "function" &&
+    typeof c.render === "function"
   ) {
     return c as EditorLike;
   }
@@ -132,20 +134,37 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
       : `hold ${settings.hotkey} to talk, release to stop`;
   }
 
-  const widget: Component = {
-    render(width: number): string[] {
+  // Registered only to receive the TUI and theme handles; the indicator is drawn on the editor's border.
+  const widget: Component = { render: () => [], invalidate() {} };
+
+  const decorated = new WeakSet<object>();
+  const restoreEditors: Array<() => void> = [];
+
+  /** Draw the recording indicator at the right end of this editor's top border while it has a take. */
+  function decorate(editor: EditorLike): void {
+    if (decorated.has(editor)) return;
+    decorated.add(editor);
+    const own = Object.getOwnPropertyDescriptor(editor, "render");
+    const base = editor.render.bind(editor);
+    editor.render = (width) => {
+      const lines = base(width);
       const t = take;
-      if (!t || !theme) return [];
-      // Right-aligned above the editor, where Claude Code shows "listening…".
+      const top = lines[0];
+      if (!t || t.editor !== editor || !theme || top === undefined) return lines;
       const label = t.phase === "connecting" ? "starting…" : t.phase === "finishing" ? "transcribing…" : "listening…";
-      const head = truncateToWidth(
-        `${theme.fg("error", "●")} ${theme.fg("accent", renderLevel(t.level, 4))} ${theme.fg("dim", label)}`,
-        Math.max(0, width - 1),
-      );
-      return [" ".repeat(Math.max(0, width - 1 - visibleWidth(head))) + head];
-    },
-    invalidate() {},
-  };
+      const meter = t.phase === "listening" ? `${theme.fg("muted", renderLevel(t.level, 4).replaceAll(" ", "▁"))} ` : "";
+      const text = meter + theme.fg("dim", label);
+      const keep = width - visibleWidth(text) - 3;
+      if (keep < 1) return lines;
+      lines[0] = `${sliceByColumn(top, 0, keep)} ${text} ${sliceByColumn(top, width - 1, 1)}\x1b[0m`;
+      return lines;
+    };
+    restoreEditors.push(() => {
+      decorated.delete(editor);
+      if (own) Object.defineProperty(editor, "render", own);
+      else delete (editor as { render?: unknown }).render;
+    });
+  }
 
   /** Text on the cursor's line before the cursor. */
   function textBeforeCursor(editor: EditorLike): string {
@@ -241,6 +260,7 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
       tapNoticeShown = true;
       notify(`This terminal does not report key releases, so ${settings.hotkey} works as tap: press it again or Escape to stop.`, "info");
     }
+    decorate(editor);
     const t = new Take(editor);
     take = t;
     render();
@@ -261,6 +281,11 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
         onAudio: (samples) => {
           t.stream?.sendAudio(samples);
           t.level = Math.max(levelOf(samples), t.level * 0.7);
+          // The device takes a moment to deliver after it is opened: `listening…` only once audio is captured.
+          if (t.phase === "connecting") {
+            t.phase = "listening";
+            render();
+          }
         },
         onFailure: (message) => void fail(t, message),
       });
@@ -268,8 +293,6 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
         await t.mic.stop();
         return;
       }
-      t.phase = "listening";
-      render();
       if (t.stopRequested) await finishTake(t);
     } catch (error) {
       await fail(t, error instanceof Error ? error.message : String(error));
@@ -283,7 +306,8 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
     }
     const t = take;
     if (!t) return;
-    if (t.phase === "connecting") {
+    if (!t.mic) {
+      // Still opening the microphone: startTake finishes the take once it is open.
       t.stopRequested = true;
       return;
     }
@@ -306,6 +330,7 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
     unsubscribe = undefined;
     detector.dispose();
     queued = false;
+    for (const restore of restoreEditors.splice(0)) restore();
     const t = take;
     take = undefined;
     if (t) {
@@ -377,7 +402,7 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
       return undefined;
     }
     if (!focusedMainEditor()) {
-      if (detector.phase === "idle" || detector.phase === "pending") {
+      if (detector.phase === "idle") {
         detector.reset();
         return undefined;
       }

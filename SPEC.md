@@ -1,4 +1,4 @@
-# pi-streaming-voice — spec (v1, with the 0.2.0 additions below)
+# pi-streaming-voice — spec (v1, with the 0.2.x additions below)
 
 Goal: a global pi extension that mirrors Claude Code's `/voice` push-to-talk 1:1, using Deepgram
 Nova-3 streaming STT instead of Anthropic's private endpoint.
@@ -21,7 +21,7 @@ Nova-3 streaming STT instead of Anthropic's private endpoint.
   2. Fallback (no release events): detect a hold from terminal auto-repeat timing, as Claude Code does; release =
      repeats stop for a gap threshold.
 - A quick tap types a normal space. A hold starts recording once detected; any spaces inserted during detection
-  are removed. Release stops recording.
+  are removed. Release stops recording. (Detection is driven by auto-repeat since 0.2.2, see "Hold detection".)
 - Only active when the main editor has focus. In overlays/dialogs/selectors Space behaves normally.
 
 ## Live transcription
@@ -30,7 +30,7 @@ Nova-3 streaming STT instead of Anthropic's private endpoint.
   Send KeepAlive/CloseStream per Deepgram docs; on release, flush and wait for final results before closing.
 - Interim words are typed live into the editor at the cursor (as in Claude Code) and revised in place; pi's editor cannot dim part of its text, so they render normally.
   Finalized text is inserted at the cursor. Never auto-submit.
-- Recording indicator + audio level meter in the status/widget area while recording.
+- While recording, a level meter and `listening…` are drawn at the right end of the editor's top border (no extra row).
 
 ## /voice command
 - Named `/voice`, like Claude Code. Pi Voice (`pi-transcribe`) also registers `/voice`, so it is uninstalled; a duplicate name would make pi rename both to `/voice:1`/`/voice:2`.
@@ -49,8 +49,8 @@ Nova-3 streaming STT instead of Anthropic's private endpoint.
   already binds (the message names the action that owns it).
 - A press must carry exactly the hotkey's modifiers (lock keys aside); a release is recognised whatever modifier or
   lock bits it carries.
-- The recording widget shows no key hint: only the dot, the meter and `listening…` / `transcribing…` (`starting…`
-  while connecting). The hotkey is shown in `/voice-settings` and the `/voice` on message only.
+- The recording indicator shows no key hint and no dot: only the meter (while listening, in the theme's muted
+  grey) and `listening…` / `transcribing…` (`starting…` while connecting). The hotkey is shown in `/voice-settings` and the `/voice` on message only.
 
 ### Mode
 - Hold (default): Space behaves as under "Push-to-talk on Space". A combo starts recording immediately on press (it
@@ -80,8 +80,8 @@ Nova-3 streaming STT instead of Anthropic's private endpoint.
 - The probe times a TCP+TLS connect to port 443 and drops the connection: no HTTP request, no API key, no stream.
 
 ## Take behaviour (0.2.0)
-- A hold that has seen auto-repeats ends when the repeats stop for the release gap, on every path: a take never keeps
-  the mic open with no key held.
+- A hold ends when its auto-repeats stop for the release gap, on every path: a take never keeps the mic open with no
+  key held (0.2.2: also before the first repeat, see "Hold detection").
 - Other keys cancel a pending kitty Space hold (`ab`, Space down, `x`, `y` gives `ab xy`, no recording).
 - Typing or moving the cursor during a take never duplicates or loses transcript text: while listening, the shown
   interim is removed before the key goes through and comes back at the cursor; during `transcribing…`, keys are held
@@ -90,6 +90,25 @@ Nova-3 streaming STT instead of Anthropic's private endpoint.
 - A take is settled as soon as the finalized result has arrived; the socket closes in the background. A hold started
   while the previous take is finishing starts as soon as that one has settled, if the key is still held.
 - If the finalize timeout (3 s) hits, a notice says the last words may be missing.
+
+## Hold detection (0.2.2)
+- Hold mode is driven by the OS auto-repeat of the held key, which must be on (with it off: tap mode with a combo).
+  A take in hold mode never keeps the mic open when no key is held, and is not cut while the key is still down.
+- Kitty path, Space: the press types a space; the first auto-repeat (plain `" "` as in Rex, or encoded) within 2 s
+  starts the take and removes that space; the release ends it. A second plain space sooner than 120 ms after the
+  first is text, not a repeat. So text that is not a held key (`word ` injected with no release, two spaces a few ms
+  apart) never records and its spaces stay. This replaces the 350 ms threshold.
+- Watchdog: every hold ends when no repeat arrives for max(500 ms, 2.5 × the repeat interval), armed from the first
+  repeat. A combo hold (which starts on the press) ends if neither a repeat nor a release follows within 2 s.
+- Resume: if the watchdog cut a kitty-path take (Space or combo) and a repeat of the hotkey arrives within 2 s with
+  no release or other key in between, the key is still down: a new take starts at once and no space is typed. On
+  the repeat-timing path the hold is detected again as usual (three rapid spaces, the typed ones removed).
+- Combo as tap where releases are not reported: the first press starts the take. After that a press within 125 ms of
+  another is auto-repeat and is ignored; a lone press toggles once 125 ms have passed with nothing following. A press
+  more than 2 s after the last one, with nothing recording, starts at once. Where releases are reported (tap mode),
+  a press after a release toggles at once.
+- `listening…` is shown from the first audio chunk the microphone delivers (`starting…` before), so it means audio is
+  being captured.
 
 ## Key
 - `DEEPGRAM_API_KEY` from the environment. Never store or log it.

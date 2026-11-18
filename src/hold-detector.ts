@@ -1,37 +1,44 @@
 /**
  * Push-to-talk detection for the voice hotkey.
  *
+ * Hold mode is driven by the OS auto-repeat of the held key: a hold is known
+ * to be alive only while repeats keep coming, so every hold ends when they
+ * stop for the release gap (or on the release event, where there is one).
+ *
  * Space (the only hotkey that also types) is always hold-to-talk, on two paths:
- *  - Kitty: the terminal reports real press/repeat/release events (pi-tui
- *    requests flags 7). The press types a space; if the key is still down after
- *    `kittyHoldMs`, it is a hold: the typed space is removed and recording
- *    starts. The release event stops recording.
- *  - Repeat timing (no release events): the terminal only sends auto-repeated
- *    spaces. A run of `repeatCount` consecutive gaps of at most `repeatGapMs`
- *    is a hold; the spaces typed so far are removed. Recording stops once no
- *    space arrives for the release gap.
+ *  - Kitty: the terminal reports key releases (pi-tui requests flags 7). The
+ *    press types a space; the first auto-repeat (plain or encoded) makes it a
+ *    hold: the typed space is removed and recording starts. A second plain
+ *    space sooner than any OS initial repeat delay (`textGapMs`) is text.
+ *  - Repeat timing (no release events): a run of `repeatCount` consecutive
+ *    gaps of at most `repeatGapMs` is a hold; the spaces typed so far are
+ *    removed.
  * The kitty path is used only once a key release event has actually been seen,
  * because a terminal can answer the kitty query without supporting event types.
  *
  * A combo (ctrl/alt/super) types nothing, so it starts recording on the press:
- *  - hold: the release stops it. Needs release events, i.e. the kitty protocol.
+ *  - hold: the release stops it, and so does `noRepeatMs` without a repeat.
+ *    Needs release events, i.e. the kitty protocol.
  *  - tap: the next press, or Escape, stops it. Also used for a hold-mode combo
  *    when the terminal has no release events.
  *
- * On every hold, once auto-repeats have been seen, repeats stopping for the
- * release gap ends the hold, so a lost release cannot leave it recording.
+ * When the repeats of a kitty-path hold stop without a release (a stall, or a
+ * lost release), the take ends; if the hotkey then repeats again within
+ * `noRepeatMs`, the key is still down and recording resumes at once.
  */
 import { isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
 import { classifyHotkey, DEFAULT_HOTKEY, isCombo, splitKeyId, type HotkeyEvent, type KeyParts, type VoiceMode } from "./hotkey.ts";
 
 export interface HoldThresholds {
-  /** Kitty, Space: key held this long without release = hold. */
-  kittyHoldMs: number;
+  /** Kitty, Space: a second plain space sooner than this after the first is text, not an auto-repeat. */
+  textGapMs: number;
+  /** Longest OS initial repeat delay: a held key has repeated by then. */
+  noRepeatMs: number;
   /** Repeat path: max gap between auto-repeated spaces. */
   repeatGapMs: number;
   /** Repeat path: consecutive rapid gaps needed to call it a hold. */
   repeatCount: number;
-  /** Max gap between the physical press and its first repeat (the OS initial repeat delay). */
+  /** Repeat path: a space this soon before the first repeat is the press of the hold, and is removed too. */
   initialDelayMaxMs: number;
   /** Minimum silence after the last repeat that counts as release. */
   releaseGapMinMs: number;
@@ -40,11 +47,12 @@ export interface HoldThresholds {
 }
 
 export const DEFAULT_THRESHOLDS: HoldThresholds = {
-  kittyHoldMs: 350,
+  textGapMs: 120,
+  noRepeatMs: 2000,
   repeatGapMs: 125,
   repeatCount: 2,
   initialDelayMaxMs: 650,
-  releaseGapMinMs: 200,
+  releaseGapMinMs: 500,
   releaseGapFactor: 2.5,
 };
 
@@ -72,8 +80,6 @@ type Held = "kitty" | "repeat";
 
 type State =
   | { kind: "idle" }
-  /** Space is down on the kitty path, not yet long enough to be a hold. */
-  | { kind: "pending" }
   | { kind: "recording"; how: Held | "tap" }
   /** Hold was cancelled (error/toggle): swallow the hotkey until it is released, without restarting. */
   | { kind: "draining"; how: Held };
@@ -85,10 +91,15 @@ export class HotkeyDetector {
   private mode: VoiceMode = "hold";
   private sawRelease = false;
   private timer: unknown;
-  // Timing of hotkey events.
+  // Timing of hotkey events during a hold.
   private lastAt = -Infinity;
   private interval = 0;
-  /** Tap: the hotkey was released since its last press. */
+  /** Kitty path: when the last plain space was typed; a repeat of it makes a hold. */
+  private pressAt = -Infinity;
+  /** When the repeats of a kitty-path hold stopped without a release: more repeats soon after resume it. */
+  private cutAt = -Infinity;
+  /** Tap: the last hotkey press, and whether the key was released since. */
+  private tapAt = -Infinity;
   private released = true;
   // Repeat-path run tracking.
   private rapid = 0;
@@ -109,6 +120,7 @@ export class HotkeyDetector {
     this.hotkey = splitKeyId(hotkey);
     this.combo = isCombo(this.hotkey);
     this.mode = mode;
+    this.tapAt = -Infinity;
     this.released = true;
   }
 
@@ -139,16 +151,13 @@ export class HotkeyDetector {
   /** Stop listening for a hold that is no longer wanted (error, voice off). Swallows the rest of the hold. */
   cancel(): void {
     const s = this.state;
-    if (s.kind === "recording") {
-      if (s.how === "tap") {
-        this.state = { kind: "idle" };
-        return;
-      }
-      this.state = { kind: "draining", how: s.how };
-      if (s.how === "repeat") this.armReleaseTimer();
-    } else if (s.kind === "pending") {
+    if (s.kind !== "recording") return;
+    if (s.how === "tap") {
       this.clearTimer();
       this.state = { kind: "idle" };
+    } else {
+      // The watchdog armed for the hold ends the draining too.
+      this.state = { kind: "draining", how: s.how };
     }
   }
 
@@ -167,30 +176,19 @@ export class HotkeyDetector {
     const s = this.state;
     if (event === "release") {
       this.released = true;
-      if (s.kind !== "idle" && s.kind !== "pending" && s.how === "kitty") this.finishHold();
+      this.cutAt = -Infinity;
+      if (s.kind !== "idle" && s.how === "kitty") this.finishHold();
       return CONSUME;
     }
     const now = this.deps.now();
     if (this.effectiveMode === "tap") {
-      // Without repeat events a held key looks like a burst of presses.
-      const repeat = event === "repeat" || (!this.released && now - this.lastAt <= this.t.initialDelayMaxMs);
-      this.lastAt = now;
-      this.released = false;
-      if (repeat) return CONSUME;
-      if (s.kind === "idle") {
-        this.state = { kind: "recording", how: "tap" };
-        this.deps.onStart();
-      } else {
-        this.finishHold();
-      }
+      if (event === "press") this.tapPress(now);
       return CONSUME;
     }
     if (s.kind === "idle") {
-      if (event === "press") {
-        this.lastAt = now;
-        this.state = { kind: "recording", how: "kitty" };
-        this.deps.onStart();
-      }
+      // A repeat with nothing recording is the key still down after the watchdog cut its take.
+      if (event === "press") this.startHeld(now, this.t.noRepeatMs);
+      else if (now - this.cutAt <= this.t.noRepeatMs) this.startHeld(now, this.releaseGap());
       return CONSUME;
     }
     // A fresh press while we think the key is down means its release was lost.
@@ -199,50 +197,83 @@ export class HotkeyDetector {
     return CONSUME;
   }
 
+  /**
+   * Tap mode. Where the terminal reports releases, a press after a release
+   * toggles at once. Otherwise a held key looks like a stream of presses: a
+   * press within the repeat gap of another is auto-repeat, and a lone press
+   * toggles once the repeat gap has passed with nothing following.
+   */
+  private tapPress(now: number): void {
+    const gap = now - this.tapAt;
+    const released = this.released;
+    this.tapAt = now;
+    this.released = false;
+    this.clearTimer();
+    if (!released && gap <= this.t.repeatGapMs) return;
+    // Nothing can be repeating before the first press, or this long after the last one.
+    if (released || (this.state.kind === "idle" && gap > this.t.noRepeatMs)) {
+      this.toggleTap();
+      return;
+    }
+    this.timer = this.deps.setTimer(() => {
+      this.timer = undefined;
+      this.toggleTap();
+    }, this.t.repeatGapMs);
+  }
+
+  private toggleTap(): void {
+    if (this.state.kind !== "idle") {
+      this.finishHold();
+      return;
+    }
+    this.state = { kind: "recording", how: "tap" };
+    this.deps.onStart();
+  }
+
   private spaceEvent(event: HotkeyEvent, data: string): InputResult {
     const s = this.state;
-    if (s.kind === "recording" || s.kind === "draining") {
+    if (s.kind !== "idle") {
       // Text keys repeat as plain text even under kitty (only release is encoded),
       // so a bare " " is a repeat; only an encoded press means we missed the release.
-      if (event === "release" || (s.how === "kitty" && event === "press" && data !== " ")) {
-        this.finishHold();
-        return CONSUME;
-      }
-      // Each repeat extends the hold.
-      this.noteRepeat(s.how === "repeat");
+      if (event === "release" || (s.how === "kitty" && event === "press" && data !== " ")) this.finishHold();
+      else this.noteRepeat(); // each repeat extends the hold
       return CONSUME;
     }
 
-    if (s.kind === "pending") {
-      if (event === "release") {
-        this.clearTimer();
-        this.state = { kind: "idle" };
-        return undefined;
-      }
-      // Repeats while waiting would type extra spaces.
-      this.noteInterval();
+    if (event === "release") {
+      this.pressAt = -Infinity;
+      this.cutAt = -Infinity;
+      return undefined;
+    }
+    if (!this.sawRelease || !this.deps.kittyActive()) return this.repeatPathSpace();
+
+    const now = this.deps.now();
+    if (now - this.cutAt <= this.t.noRepeatMs) {
+      // Still down after the watchdog cut its take.
+      this.startHeld(now, this.releaseGap());
       return CONSUME;
     }
-
-    // idle
-    if (event === "release") return undefined;
-    if (this.sawRelease && this.deps.kittyActive()) {
-      if (event === "repeat") return CONSUME; // stray repeat, nothing to do
-      this.state = { kind: "pending" };
-      this.lastAt = this.deps.now();
-      this.interval = 0;
-      this.clearTimer();
-      this.timer = this.deps.setTimer(() => {
-        this.timer = undefined;
-        if (this.state.kind !== "pending") return;
-        this.state = { kind: "recording", how: "kitty" };
-        this.deps.deleteSpaces(1);
-        this.deps.onStart();
-        if (this.state.kind === "recording" && this.interval > 0) this.armReleaseTimer();
-      }, this.t.kittyHoldMs);
-      return undefined; // the press types its space
+    const gap = now - this.pressAt;
+    // An encoded repeat is one for certain; a plain space is one if it comes no sooner than an OS initial delay.
+    if (gap <= this.t.noRepeatMs && (event === "repeat" || gap >= this.t.textGapMs)) {
+      this.deps.deleteSpaces(1);
+      this.startHeld(now, this.releaseGap());
+      return CONSUME;
     }
-    return this.repeatPathSpace();
+    if (event === "repeat") return CONSUME; // stray repeat, nothing to do
+    this.pressAt = now;
+    return undefined; // the press types its space
+  }
+
+  /** The key is down on the kitty path: record until its release, or until `watchdogMs` pass without a repeat. */
+  private startHeld(now: number, watchdogMs: number): void {
+    this.pressAt = -Infinity;
+    this.cutAt = -Infinity;
+    this.lastAt = now;
+    this.interval = 0;
+    this.state = { kind: "recording", how: "kitty" };
+    this.armWatchdog(watchdogMs);
+    this.deps.onStart();
   }
 
   private repeatPathSpace(): InputResult {
@@ -264,7 +295,7 @@ export class HotkeyDetector {
     const typed = this.passedInRun - 1 + this.leadIn;
     this.resetRunCounters();
     this.state = { kind: "recording", how: "repeat" };
-    this.armReleaseTimer();
+    this.armWatchdog(this.releaseGap());
     if (typed > 0) this.deps.deleteSpaces(typed);
     this.deps.onStart();
     return CONSUME;
@@ -283,49 +314,44 @@ export class HotkeyDetector {
     } else if (s.kind === "draining" && s.how === "repeat") {
       this.clearTimer();
       this.state = { kind: "idle" };
-    } else if (s.kind === "pending") {
-      // Space then more typing while it is still down: a typed space, not a hold.
-      this.clearTimer();
-      this.state = { kind: "idle" };
     }
     if (this.state.kind === "idle") this.resetRun();
     return undefined;
   }
 
-  /** A repeat of the held hotkey: measure the interval and, once it is known, watch for the repeats stopping. */
-  private noteRepeat(always = false): void {
-    this.noteInterval();
-    if (always || this.interval > 0) this.armReleaseTimer();
-  }
-
-  private noteInterval(): void {
+  /** A repeat of the held hotkey: measure the interval and watch for the repeats stopping. */
+  private noteRepeat(): void {
     const now = this.deps.now();
     const gap = now - this.lastAt;
     this.lastAt = now;
     if (gap > 0 && gap <= this.t.repeatGapMs * 2) this.interval = gap;
+    this.armWatchdog(this.releaseGap());
   }
 
   private releaseGap(): number {
     return Math.max(this.t.releaseGapMinMs, this.interval * this.t.releaseGapFactor);
   }
 
-  private armReleaseTimer(): void {
+  /** End the hold if no hotkey event arrives for `ms`. */
+  private armWatchdog(ms: number): void {
     this.clearTimer();
     this.timer = this.deps.setTimer(() => {
       // Let input that queued up behind a busy event loop arrive before calling it a release.
       this.timer = this.deps.setTimer(() => {
         this.timer = undefined;
-        this.finishHold();
+        this.finishHold(true);
       }, 0);
-    }, this.releaseGap());
+    }, ms);
   }
 
-  private finishHold(): void {
+  /** `cut`: the repeats stopped without a release, so the key may still be down. */
+  private finishHold(cut = false): void {
     this.clearTimer();
-    const wasRecording = this.state.kind === "recording";
+    const s = this.state;
     this.state = { kind: "idle" };
     this.resetRun();
-    if (wasRecording) this.deps.onStop();
+    if (cut && s.kind === "recording" && s.how === "kitty") this.cutAt = this.deps.now();
+    if (s.kind === "recording") this.deps.onStop();
   }
 
   private resetRunCounters(): void {
@@ -338,6 +364,8 @@ export class HotkeyDetector {
     this.resetRunCounters();
     this.lastAt = -Infinity;
     this.interval = 0;
+    this.pressAt = -Infinity;
+    this.cutAt = -Infinity;
   }
 
   private clearTimer(): void {

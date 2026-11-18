@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.2.2] - 2026-11-18
+
+### Changed
+- Space hold in kitty-protocol terminals (Rex, Kitty, Ghostty) starts on the first auto-repeat of the key instead
+  of after 350 ms, so it starts after the OS "delay until repeat". Hold mode needs the OS key repeat to be on; with
+  it off, use tap mode with a combo.
+- A hold ends when its repeats stop for max(500 ms, 2.5 × the repeat interval) (was 200 ms), so a short stall no
+  longer ends it.
+- `listening…` appears once the microphone is delivering audio, not when it has been opened.
+- The recording indicator is drawn at the right end of the editor's top border instead of on its own row above
+  the editor, so the screen no longer shifts. The red dot is gone and the level meter is grey.
+
+### Fixed
+- Text ending in a space that was not typed by a held key (a paste, `rex send`, a dictation tool) started a take
+  that never stopped. Without auto-repeat nothing records now, and two spaces a few ms apart are text.
+- A key release lost before the first auto-repeat left the microphone open, for Space and for combos. A combo hold
+  now also ends if no repeat or release follows the press within 2 s.
+- A hold cut because its repeats stalled did not come back while the key was still down. The next repeat now
+  starts a new take at once, leaving no spaces behind.
+- Combo as tap (terminals without key-release events): a second press within 650 ms of the first was ignored, and
+  with an OS repeat delay over 650 ms the auto-repeat stopped the take it had just started. A press now counts as
+  one when no other follows it within 125 ms.
+- The first word was lost when speech started the moment `listening…` appeared: the label was shown before the
+  microphone delivered audio.
+
 ## [0.2.1] - 2026-11-18
 
 ### Added

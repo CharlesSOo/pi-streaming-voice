@@ -23,6 +23,8 @@ export const mic = {
   /** When set, Recorder.open waits for this promise (a slow device open). */
   gate: undefined as Promise<void> | undefined,
   permission: "granted",
+  /** The device opens but delivers no audio by itself. */
+  silent: false,
 };
 mock.module("@handy-computer/recorder", {
   namedExports: {
@@ -38,6 +40,8 @@ mock.module("@handy-computer/recorder", {
           info: { format: { sampleRate: 16000, channels: 1 } },
           start() {
             r.isRecording = true;
+            // A real device delivers its first chunk shortly after it starts.
+            if (!mic.silent) setImmediate(() => opts.onChunk({ samples: new Float32Array(800) }));
           },
           async stop() {
             r.isRecording = false;
@@ -132,13 +136,14 @@ export interface Rig {
   focused: Focusable | undefined;
   /** Feed raw terminal input the way pi-tui's handleTerminalInput does. */
   feed(data: string): "consumed" | "passed";
-  widgetLines(): string[];
+  /** The recording indicator on the editor's top border, or "" when there is none. */
+  indicator(): string;
   /** What the focused component (the settings menu) shows. */
   screen(): string;
   /** Run a slash command; resolves when its handler returns. */
   command(name?: string): Promise<void>;
   shutdown(): void;
-  /** Kitty-path Space hold: press and wait past the 350 ms threshold. */
+  /** Kitty-path Space hold: press, then the first auto-repeat. */
   hold(): Promise<void>;
   release(): void;
   socket(): FakeSocket;
@@ -157,18 +162,19 @@ export function makeRig(opts: { kitty?: boolean; timings?: Timings; settings?: o
   mic.recorders = [];
   mic.gate = undefined;
   mic.permission = "granted";
+  mic.silent = false;
   setKittyProtocolActive(opts.kitty ?? true);
 
   const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
   const commands = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
   let listener: ((data: string) => { consume?: boolean; data?: string } | undefined) | undefined;
-  let widget: { render(width: number): string[] } | undefined;
 
   const rig = { notifications: [], overlay: false, focused: undefined } as unknown as Rig;
   const tui = {
     requestRender: () => {},
     hasOverlay: () => rig.overlay,
     getFocusedComponent: () => rig.focused,
+    terminal: { rows: 40 },
   } as unknown as TUI;
   const ident = (s: string) => s;
   rig.editor = new Editor(tui, {
@@ -184,7 +190,7 @@ export function makeRig(opts: { kitty?: boolean; timings?: Timings; settings?: o
     mode: "tui",
     ui: {
       setWidget: (_key: string, factory: (t: unknown, th: unknown) => { render(width: number): string[] }) => {
-        widget = factory(tui, theme);
+        factory(tui, theme);
       },
       onTerminalInput: (fn: NonNullable<typeof listener>) => {
         listener = fn;
@@ -219,7 +225,7 @@ export function makeRig(opts: { kitty?: boolean; timings?: Timings; settings?: o
     if (focused?.handleInput && !(isKeyRelease(data) && !focused.wantsKeyRelease)) focused.handleInput(data);
     return "passed";
   };
-  rig.widgetLines = () => widget?.render(120) ?? [];
+  rig.indicator = () => /^─+ (.*) ─\x1b\[0m$/.exec(rig.editor.render(120)[0] ?? "")?.[1] ?? "";
   rig.screen = () => (rig.focused?.render?.(100) ?? []).join("\n");
   rig.command = async (name = "voice") => {
     await commands.get(name)?.("", ctx);
@@ -230,7 +236,8 @@ export function makeRig(opts: { kitty?: boolean; timings?: Timings; settings?: o
   rig.hold = async () => {
     rig.feed(OTHER_RELEASE); // a key release seen earlier → kitty path
     rig.feed(" ");
-    await sleep(380);
+    await sleep(150);
+    rig.feed(" ");
   };
   rig.release = () => {
     rig.feed(K_RELEASE);
