@@ -17,6 +17,8 @@ import type { VoiceSettings } from "./settings.ts";
 export interface SettingsHost {
   current(): VoiceSettings;
   update(patch: Partial<VoiceSettings>): void;
+  /** Takes come from the Mac through the voice bridge, which picks the region there: no Region row. */
+  regionOnMac?: boolean;
 }
 
 const REGION_LABELS: Record<Region, string> = { global: "Global", eu: "EU", au: "Australia", in: "India" };
@@ -95,7 +97,7 @@ export function createSettingsMenu(
       currentValue: settings.mode,
       values: ["hold", "tap"],
     },
-    regionItem,
+    ...(host.regionOnMac ? [] : [regionItem]),
   ];
 
   const list = new SettingsList(

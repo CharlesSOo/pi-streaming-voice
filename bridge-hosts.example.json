@@ -1,0 +1,7 @@
+{
+  "hosts": [
+    { "name": "devbox", "ssh": "devbox", "macPort": 47811, "via": "ssh", "serverPort": 47821 },
+    { "name": "devbox-bob", "ssh": "bob@devbox", "macPort": 47812, "via": "rex", "rexHost": "devbox-bob", "serverPort": 47822 },
+    { "name": "devbox-alice", "ssh": "alice@devbox", "macPort": 47813, "via": "tailnet" }
+  ]
+}

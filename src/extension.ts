@@ -8,8 +8,9 @@ import {
   type Component,
   type TUI,
 } from "@earendil-works/pi-tui";
-import { levelOf, openMicrophone, renderLevel, type Microphone } from "./audio.ts";
-import { buildListenUrl, DeepgramStream } from "./deepgram.ts";
+import { renderLevel } from "./audio.ts";
+import { BridgeConnector, BridgeTranscriber, bridgeConfigured, bridgeTokenPath, loadBridgeConfig } from "./bridge-client.ts";
+import { LocalTranscriber, type Transcriber } from "./transcriber.ts";
 import { measureRegions, pickRegion, type MeasureRegions } from "./region-probe.ts";
 import { BACKSPACE, HotkeyDetector } from "./hold-detector.ts";
 import { loadSettings, saveSettings, settingsPath, type VoiceSettings } from "./settings.ts";
@@ -61,8 +62,9 @@ class Take {
   shown = "";
   level = 0;
   stopRequested = false;
-  mic: Microphone | undefined;
-  stream: DeepgramStream | undefined;
+  transcriber: Transcriber | undefined;
+  /** Capture is open: a stop can finish the take right away. */
+  started = false;
   inserted = false;
   /** Over (finished, failed or shut down): nothing more may touch the editor. */
   ended = false;
@@ -82,8 +84,66 @@ function isEditorInput(data: string): boolean {
   return data.startsWith("\x1b[200~") || parseKey(data) !== undefined;
 }
 
-/** `measure` is replaced in tests; pi calls this with `pi` only. */
-export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions = measureRegions): void {
+/** Where takes come from on this host. */
+export interface TranscriberSource {
+  /** `local`: this machine's microphone and Deepgram key. `bridge`: the Mac's, through the voice bridge. */
+  kind: "local" | "bridge";
+  /** Whether a take can start at all; without one the hotkey is inert. */
+  available(): boolean;
+  /** Why it is not available, and how to fix it. */
+  help(): string;
+  /** Throws with a message for the user if this take cannot be set up. */
+  create(settings: VoiceSettings): Transcriber;
+  /** Get ready for the next take ahead of time (session start). */
+  warm?(): void;
+  /** Session over: let go of anything kept ready. */
+  dispose?(): void;
+}
+
+export function localSource(): TranscriberSource {
+  return {
+    kind: "local",
+    available: () => apiKey() !== undefined,
+    help: () => `${KEY_ENV} is not set. ${KEY_HELP}`,
+    create: (settings) => {
+      const key = apiKey();
+      if (!key) throw new Error(`${KEY_ENV} is not set`);
+      return new LocalTranscriber(key, settings.region === "auto" ? settings.autoPick?.region : settings.region);
+    },
+  };
+}
+
+export function bridgeSource(agentDir: string): TranscriberSource {
+  let connector: BridgeConnector | undefined;
+  const get = () => (connector ??= new BridgeConnector(() => loadBridgeConfig(agentDir)));
+  return {
+    kind: "bridge",
+    available: () => bridgeConfigured(agentDir),
+    help: () =>
+      `the voice bridge is not set up on this host (no ${bridgeTokenPath(agentDir)}). Run the bridge install on the Mac; see "Remote hosts" in the README.`,
+    create: () => new BridgeTranscriber(get()),
+    // An authenticated idle connection kept open, so pressing the hotkey only sends `start`.
+    warm: () => {
+      if (bridgeConfigured(agentDir)) get().warm();
+    },
+    dispose: () => {
+      connector?.dispose();
+      connector = undefined;
+    },
+  };
+}
+
+/** macOS: this machine's microphone. Elsewhere: the Mac's, through the voice bridge (it needs no Deepgram key here). */
+export function defaultSource(agentDir: string): TranscriberSource {
+  return process.platform === "darwin" ? localSource() : bridgeSource(agentDir);
+}
+
+/** `measure` and `source` are replaced in tests; pi calls this with `pi` only. */
+export default function streamingVoice(
+  pi: ExtensionAPI,
+  measure: MeasureRegions = measureRegions,
+  source: TranscriberSource = defaultSource(getAgentDir()),
+): void {
   const path = settingsPath(getAgentDir());
   let settings: VoiceSettings = loadSettings(path);
   let tui: TUI | undefined;
@@ -247,18 +307,17 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
     // A take that is already finishing no longer owns the hotkey.
     if (take === t && t.phase !== "finishing") detector.cancel();
     settle(t);
-    t.stream?.abort();
-    await t.mic?.stop();
+    await t.transcriber?.abort();
   }
 
   async function startTake(): Promise<void> {
-    const key = apiKey();
-    if (take?.phase === "finishing" && key && settings.enabled) {
+    const available = source.available();
+    if (take?.phase === "finishing" && available && settings.enabled) {
       queued = true;
       return;
     }
     const editor = focusedMainEditor();
-    if (!key || !editor || take || !settings.enabled) {
+    if (!available || !editor || take || !settings.enabled) {
       detector.cancel();
       return;
     }
@@ -272,31 +331,25 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
     render();
     t.repaint = setInterval(render, 250);
     try {
-      t.stream = new DeepgramStream(
-        key,
-        {
-          onInterim: (text) => showLive(t, text),
-          onFinal: (text) => commitFinal(t, text),
-          onError: (message) => void fail(t, message),
-        },
-        undefined,
-        undefined,
-        buildListenUrl(settings.region === "auto" ? settings.autoPick?.region : settings.region),
-      );
-      t.mic = await openMicrophone({
-        onAudio: (samples) => {
-          t.stream?.sendAudio(samples);
-          t.level = Math.max(levelOf(samples), t.level * 0.7);
-          // The device takes a moment to deliver after it is opened: `listening…` only once audio is captured.
+      t.transcriber = source.create(settings);
+      await t.transcriber.start({
+        onListening: () => {
+          // `listening…` only once audio is captured.
           if (t.phase === "connecting") {
             t.phase = "listening";
             render();
           }
         },
-        onFailure: (message) => void fail(t, message),
+        onLevel: (level) => {
+          t.level = Math.max(level, t.level * 0.7);
+        },
+        onInterim: (text) => showLive(t, text),
+        onFinal: (text) => commitFinal(t, text),
+        onError: (message) => void fail(t, message),
       });
+      t.started = true;
       if (t.ended) {
-        await t.mic.stop();
+        await t.transcriber.abort();
         return;
       }
       if (t.stopRequested) await finishTake(t);
@@ -312,7 +365,7 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
     }
     const t = take;
     if (!t) return;
-    if (!t.mic) {
+    if (!t.started) {
       // Still opening the microphone: startTake finishes the take once it is open.
       t.stopRequested = true;
       return;
@@ -324,14 +377,14 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
     if (t.phase === "finishing" || t.ended) return;
     t.phase = "finishing";
     render();
-    await t.mic?.stop();
-    const finalized = (await t.stream?.finish()) ?? true;
+    const finalized = (await t.transcriber?.finish()) ?? true;
     if (t.ended) return;
     if (!finalized) notify("Deepgram did not answer in time: the last words may be missing.", "warning");
     settle(t);
   }
 
   function shutdown(): void {
+    source.dispose?.();
     unsubscribe?.();
     unsubscribe = undefined;
     detector.dispose();
@@ -344,8 +397,7 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
     if (t) {
       t.ended = true;
       if (t.repaint) clearInterval(t.repaint);
-      t.stream?.abort();
-      void t.mic?.stop();
+      void t.transcriber?.abort();
     }
   }
 
@@ -362,7 +414,8 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
    * take and the next sessions.
    */
   async function measureAuto(force = false): Promise<void> {
-    if (probe || settings.region !== "auto" || !settings.enabled) return;
+    // On a bridge host the Mac picks the region.
+    if (probe || source.kind !== "local" || settings.region !== "auto" || !settings.enabled) return;
     const age = Date.now() - (settings.autoPick?.at ?? -Infinity);
     if (!force && age >= 0 && age < AUTO_MAX_AGE_MS) return;
     const mine = new AbortController();
@@ -407,6 +460,7 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
   pi.on("session_start", (_event, ctx) => {
     if (!ctx.hasUI) return;
     ctxRef = ctx;
+    source.warm?.();
     void measureAuto();
     ctx.ui.setWidget(WIDGET_KEY, (ui, th) => {
       tui = ui;
@@ -421,7 +475,7 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
   });
 
   function hotkeyInput(data: string): ReturnType<HotkeyDetector["handle"]> {
-    if (!settings.enabled || !apiKey()) {
+    if (!settings.enabled || !source.available()) {
       if (detector.phase !== "idle" && !take) detector.reset();
       return undefined;
     }
@@ -450,7 +504,7 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
     handler: async (_args, ctx) => {
       update({ enabled: !settings.enabled });
       const state = `Streaming voice ${settings.enabled ? "on" : "off"}`;
-      if (!apiKey()) ctx.ui.notify(`${state}, but ${KEY_ENV} is not set. ${KEY_HELP}`, "warning");
+      if (!source.available()) ctx.ui.notify(`${state}, but ${source.help()}`, "warning");
       else ctx.ui.notify(settings.enabled ? `${state}: ${usage()}` : state, "info");
     },
   });
@@ -463,7 +517,7 @@ export default function streamingVoice(pi: ExtensionAPI, measure: MeasureRegions
         return;
       }
       await ctx.ui.custom<void>((ui, th, keybindings, done) =>
-        createSettingsMenu(ui, th, keybindings, { current: () => settings, update }, () => done()),
+        createSettingsMenu(ui, th, keybindings, { current: () => settings, update, regionOnMac: source.kind === "bridge" }, () => done()),
       );
     },
   });

@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.3.0] - 2026-11-21
+
+### Added
+- Voice in pi on remote hosts. A voice bridge on the Mac (`npm run bridge:install`) records with the Mac's
+  microphone, streams to Deepgram with the Mac's key and sends only the text and the level meter to pi on the host,
+  through an `ssh -R` kept up by launchd (no extra software), a Rex forward, or, for accounts that cannot use
+  loopback TCP, straight over Tailscale. Hosts are described
+  in `~/Library/Application Support/pi-streaming-voice-bridge/hosts.json` (see `bridge-hosts.example.json`); the
+  installer sets up the Mac (launchd agents, a small launcher compiled from `native/disclaim.c` so the bridge
+  gets microphone permission as `node`) and each host (repo, `pi install`, token). See "Remote hosts" in the
+  README.
+- Per-host tokens with mutual HMAC-SHA256 challenge-response: the token never crosses the wire, and pi checks the
+  bridge too. Strict message schema, 4 KB line limit, microphone only during a take, at most 10 minutes, one take at
+  a time.
+- On a host, pi keeps one authenticated idle connection to the bridge, so a take starts without a new connection
+  through the tunnel.
+- `scripts/bridge-check.ts` tests a host without pi; `npm run bridge:uninstall` removes the setup.
+
+### Changed
+- On a non-macOS host the hotkey needs the bridge's token file instead of `DEEPGRAM_API_KEY`, the Region row is
+  hidden (the Mac's setting applies), and Auto region is not measured there.
+
 ## [0.2.3] - 2026-11-18
 
 ### Changed

@@ -8,6 +8,8 @@ Speech is streamed to Deepgram Nova-3 and the text lands at your cursor as you s
 - Words are typed into the editor at the cursor as you speak and corrected in place as Deepgram refines them
   (like Claude Code's `/voice`). A small level meter and `listening…` show at the right end of the editor's top border.
 - Only active when the main editor has focus; in dialogs, selectors and overlays the hotkey behaves normally.
+- Works in pi on remote hosts too: a small bridge on the Mac records there and sends only the text to the host (see
+  [Remote hosts](#remote-hosts)).
 - Registers `/voice`, so it replaces Pi Voice (`pi-transcribe`): uninstall that package first, or both commands get renamed to `/voice:1`/`/voice:2`.
 
 ## Install
@@ -29,6 +31,9 @@ pi install git:github.com/CharlesSOo/pi-streaming-voice
 
 Personal installs go into `~/.pi/agent/settings.json`, so the extension loads in every directory.
 To try it once without installing: `pi -e ~/Code/pi-streaming-voice`.
+
+For pi on a remote host (Linux included), install on the Mac as above and then follow
+[Remote hosts](#remote-hosts); the installer sets up the hosts.
 
 ## Deepgram key
 
@@ -194,6 +199,136 @@ network look the same from here).
 On release the stream is flushed (`Finalize`) and the take waits up to 3 s for Deepgram to confirm the final words
 (3 s more if the connection was still opening); if that runs out, it says the last words may be missing. The socket
 is then closed (`CloseStream`) in the background.
+
+## Remote hosts
+
+Dictate into pi running on a server, using your Mac's microphone. pi runs on the remote host (in an ssh session, a
+Rex pane, anything), and holding Space works there exactly as it does locally.
+
+On a non-macOS host the extension opens no microphone and needs no Deepgram key. It talks to the *voice bridge*, a
+small daemon on the Mac that captures audio, streams it to Deepgram with the Mac's key and sends back only the text
+and the level meter. `/voice` and `/voice-settings` work as usual; the Region row is hidden on the host, because the
+bridge uses the Mac's region setting.
+
+```
+Mac: voice bridge (launchd)                                     remote account
+  mic → Deepgram                                                 pi + this extension
+  127.0.0.1:47811  ←── ssh -R ───────  127.0.0.1:47821  ←──     "via": "ssh"
+  127.0.0.1:47812  ←── Rex forward ──  127.0.0.1:47822  ←──     "via": "rex"
+  <Mac's Tailscale IP>:47813  ←── Tailscale ────────────────     "via": "tailnet"
+```
+
+### Security in brief
+
+- Audio and the Deepgram key never leave the Mac (except audio to Deepgram). Only text crosses to the host.
+- Every remote account gets its own random 32-byte token, and its own port on the Mac that accepts only that token.
+  A compromised account cannot use another's port. Forwards listen on the server's loopback only.
+- Mutual challenge-response: both sides prove they hold the token with HMAC-SHA256 over each other's random nonces.
+  The token never crosses the wire, and pi checks the bridge as well, so another user on the host who grabs the
+  port first learns nothing and cannot type into your editor.
+- Unauthenticated connections are closed after 8 s; lines over 4 KB or anything off the message schema drop the
+  connection.
+- The microphone opens only for a take (after authentication and an explicit start) and closes on stop, disconnect,
+  error or after 10 minutes. One take at a time across all hosts. An idle connection holds no device.
+- Token files are 0600 on both ends, and the extension refuses a token file others can read. The log
+  (`~/Library/Logs/pi-streaming-voice-bridge.log`) records auth failures and take start/stop, never tokens or text.
+
+### Prerequisites
+
+- **A Mac** with this repo cloned and `npm install`ed, `DEEPGRAM_API_KEY` set in your shell, and the Xcode Command
+  Line Tools (`xcode-select --install`; the installer compiles a tiny launcher with `cc`).
+- **ssh** from the Mac to each remote account with key login and no prompt (the host already in `known_hosts`), and
+  **rsync**. On the host: Node ≥ 22.19 and pi.
+- Then one route per host:
+  - **`ssh`** (default, nothing else needed): launchd keeps an `ssh -N -R` open to the host.
+  - **`rex`**: if you use Rex, a Rex forward instead (the host must be in `rex hosts`). Its block lives in a session
+    `voice-bridge` on the host, away from your windows.
+  - **`tailnet`**: Tailscale on both ends, for accounts that cannot use loopback TCP on their server (some hardened
+    setups block it per user). The bridge listens on the Mac's Tailscale address for that account only.
+
+### Setup
+
+1. Describe your hosts. Copy the example and edit it:
+
+   ```sh
+   mkdir -p ~/Library/Application\ Support/pi-streaming-voice-bridge
+   cp bridge-hosts.example.json ~/Library/Application\ Support/pi-streaming-voice-bridge/hosts.json
+   ```
+
+   ```json
+   {
+     "hosts": [
+       { "name": "devbox", "ssh": "devbox", "macPort": 47811, "via": "ssh", "serverPort": 47821 },
+       { "name": "devbox-bob", "ssh": "bob@devbox", "macPort": 47812, "via": "rex", "rexHost": "devbox-bob", "serverPort": 47822 },
+       { "name": "devbox-alice", "ssh": "alice@devbox", "macPort": 47813, "via": "tailnet" }
+     ]
+   }
+   ```
+
+   - `name`: a label (letters, digits, `-`). `ssh`: the destination the installer (and the `ssh` route) uses.
+     `macPort`: the bridge's port on the Mac, unique per host.
+   - `"via": "ssh"` or `"rex"`: `serverPort` is the loopback port pi connects to on the server; accounts on the same
+     server need different ones. `rex` also needs `rexHost`, the Rex host label.
+   - `"via": "tailnet"`: no forward; pi connects to the Mac's Tailscale address on `macPort`.
+
+   The file stays on your Mac, out of the repo.
+
+2. Install, from the Mac (idempotent, safe to rerun):
+
+   ```sh
+   npm run bridge:install                # Mac side, then every host
+   npm run bridge:install -- --mac-only  # Mac side only
+   ```
+
+   On the Mac it creates the tokens, copies the Deepgram key into a 0600 file, records the Tailscale address if
+   needed, compiles `native/disclaim.c`, and loads the launchd agents `dev.pi-streaming-voice.bridge` and
+   `dev.pi-streaming-voice.forward.<name>` (forwards restart after 30 s if they drop or the host is down). On each host
+   it rsyncs the repo to `~/Code/pi-streaming-voice`, runs `npm install` and `pi install`, and writes
+   `~/.pi/agent/pi-streaming-voice-bridge.json` and `.token` (0600). Nothing else in the host's pi settings is touched.
+
+3. **Microphone permission.** macOS never grants the microphone to a process launchd starts directly, so the bridge
+   runs through `disclaim`, which makes `node` its own "responsible process". The first take then makes macOS ask
+   whether **node** may use the microphone (it is listed under that name, or as the node binary's path, in System
+   Settings → Privacy & Security → Microphone). Allow it once. If `node` is upgraded (a new binary), macOS may ask again.
+
+4. `/reload` (or restart) pi in each remote session. The extension then keeps one authenticated idle connection to
+   the bridge, so pressing the hotkey only has to send `start`.
+
+5. Check a host without pi: in `~/Code/pi-streaming-voice` on the host, `node scripts/bridge-check.ts 3`
+   authenticates, records 3 s on the Mac and prints the handshake time, the time to `listening`, and what came back.
+
+Restart the bridge with `launchctl kickstart -k gui/$(id -u)/dev.pi-streaming-voice.bridge` (or `...forward.<name>`).
+After a Deepgram key change, or after editing `hosts.json`, run the install again. A host removed from `hosts.json`
+keeps its forward agent until you `launchctl bootout gui/$(id -u)/dev.pi-streaming-voice.forward.<name>`.
+
+### Troubleshooting
+
+| Message in pi | What to do |
+|---|---|
+| `the voice bridge is not set up on this host` | No token file on the host: run `npm run bridge:install` on the Mac. |
+| `Voice bridge not reachable on 127.0.0.1:PORT` | The bridge or the forward is down. On the Mac, `launchctl list \| grep pi-streaming-voice` and the logs in `~/Library/Logs/pi-streaming-voice-bridge*.log` (for `ssh`, the forward log shows ssh's error, e.g. `remote port forwarding failed` when the port is taken; for `rex`, `rex -S <host> forward ls -s voice-bridge`). For a `tailnet` host, check Tailscale on both ends. If the account cannot connect to loopback at all, switch it to `"via": "tailnet"`. |
+| `did not finish the handshake in time` | The tunnel is very slow or stuck; retry, then restart the forward. |
+| `refused the connection: check the token` | The host's token does not match the Mac's: rerun the install. |
+| `failed authentication: something else may be listening on that port` | Another program holds that port on the server. Pick another `serverPort`. |
+| `is readable by other users` | `chmod 600 ~/.pi/agent/pi-streaming-voice-bridge.token`. |
+| `Voice bridge is busy with a take from another session` | Another pi is recording; one take at a time. |
+| `Microphone access denied` / `did not finish opening in time` | On the Mac: allow node in System Settings → Privacy & Security → Microphone (then `launchctl kickstart -k gui/$(id -u)/dev.pi-streaming-voice.bridge`), and close other apps holding the microphone. |
+
+### Limitations
+
+- The bridge is macOS only; the host side runs anywhere pi and Node run.
+- Microphone permission relies on `responsibility_spawnattrs_setdisclaim`, an undocumented macOS API. If a macOS update changes it, the bridge stops getting the
+  microphone; the fallback is to run `node bridge.ts` in a terminal that has microphone access.
+- The `ssh` route needs a non-interactive key login; a key with a passphrase must be in the agent launchd sees
+  (macOS keychain), or the forward cannot start.
+- The installer assumes `~/Code/pi-streaming-voice` on each host and `bash`, `rsync`, `npm` and `pi` on its login PATH.
+
+### Uninstall
+
+`npm run bridge:uninstall` stops and removes the launchd agents (and Rex forward sessions), the tokens, key file,
+Tailscale address and compiled launcher on the Mac, and each host's bridge config and token (the extension there goes inert). Your
+`hosts.json` stays. Add `-- --mac-only` to leave the hosts alone. The repo copy and `pi install` on the hosts stay
+(`pi remove ~/Code/pi-streaming-voice` there).
 
 ## Development
 
